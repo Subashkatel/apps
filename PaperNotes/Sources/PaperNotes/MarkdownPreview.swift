@@ -55,6 +55,7 @@ struct MarkdownPreview: NSViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate {
         var pending: String = ""
         private var ready = false
+        private var rendered: String?
         private weak var view: WKWebView?
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -63,9 +64,18 @@ struct MarkdownPreview: NSViewRepresentable {
             flush(into: webView)
         }
 
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if navigationAction.navigationType == .linkActivated, let url = navigationAction.request.url {
+                if ["https", "http", "frontier", "mailto"].contains(url.scheme ?? "") { NSWorkspace.shared.open(url) }
+                decisionHandler(.cancel); return
+            }
+            decisionHandler(.allow)
+        }
+
         /// Held until the page has loaded, otherwise the first keystrokes are lost.
         func flush(into webView: WKWebView) {
             guard ready else { self.view = webView; return }
+            guard rendered != pending else { return }; rendered = pending
             let data = (try? JSONSerialization.data(withJSONObject: [pending])) ?? Data()
             let json = String(data: data, encoding: .utf8) ?? "[\"\"]"
             // Passing through JSON avoids every quoting and newline hazard.

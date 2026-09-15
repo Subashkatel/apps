@@ -1,4 +1,5 @@
 import Foundation
+import LocalSupport
 import CoreGraphics
 
 /// Exercises the parts that would fail silently: the markdown round-trip (a lossy
@@ -12,6 +13,66 @@ enum SelfTest {
             print("\(ok ? "PASS" : "FAIL")  \(label)\(detail.isEmpty ? "" : " — \(detail)")")
             if !ok { fails += 1 }
         }
+
+        // Storage checks run only with the test runner's isolated data root.
+        if ProcessInfo.processInfo.environment["LOCAL_APPS_TESTING"] == "1",
+           ProcessInfo.processInfo.environment["LOCAL_APPS_DATA_ROOT"] != nil {
+            let model = AppModel.shared
+            model.bootstrap()
+            var saved = Paper(arxivID: "9901.00001")
+            saved.title = "Storage original"
+            saved.body = "Original text"
+            let original = Library.shared.save(saved)
+            check("storage: initial save succeeds", original != nil)
+            saved.title = "Storage replacement"
+            saved.body = "Edited text that must survive"
+            let blocked = Library.papersDir.appendingPathComponent(saved.filename)
+            try? FileManager.default.createDirectory(at: blocked, withIntermediateDirectories: true)
+            model.draft = saved
+            model.save()
+            check("storage: failed rename keeps the old file", original.map {
+                (try? String(contentsOf: $0))?.contains("Original text") == true
+            } ?? false)
+            check("storage: failed save keeps the editor draft", model.draft?.body == saved.body)
+            check("storage: failed save reports an error", model.saveError != nil)
+            try? FileManager.default.removeItem(at: blocked)
+            model.saveError = nil
+            model.save()
+            check("storage: retry saves the replacement", Library.shared.paper(withID: saved.arxivID)?.body == saved.body)
+            check("storage: successful rename retires the old filename", original.map {
+                !FileManager.default.fileExists(atPath: $0.path)
+            } ?? false)
+            var second = Paper(arxivID: "9901.00002"); second.body = "Second note"; _ = Library.shared.save(second)
+            model.draft?.body = "Unsaved words retained on switching"
+            model.select(second.id)
+            check("switching papers saves unfinished writing", Library.shared.paper(withID: saved.id)?.body.trimmingCharacters(in: .whitespacesAndNewlines) == "Unsaved words retained on switching", "stored: \(Library.shared.paper(withID: saved.id)?.body ?? "missing"); error: \(model.saveError ?? "none")")
+            if let fixture = ProcessInfo.processInfo.environment["READING_TEST_PDF"] {
+                let packet = ReadingHandoff(materialID: "test-source", title: "Shared source", origin: "https://arxiv.org/abs/9901.00002", originalPath: fixture, annotationID: "test-selection", page: 2, quote: "The selected evidence", note: "A question")
+                do {
+                    let url = try packet.write()
+                    model.receive(url)
+                    let firstBody = model.draft?.body
+                    check("handoff opens matching review and retains its original note", model.draft?.id == second.id && model.draft?.body.hasPrefix("Second note") == true)
+                    check("handoff adopts a usable original PDF", model.draft?.resolvedPDF != nil)
+                    model.receive(url)
+                    check("receiving same source twice preserves one passage", model.draft?.body == firstBody)
+                } catch { check("handoff receipt", false, error.localizedDescription) }
+            }
+            check("storage: no default remote", Git.run(["remote", "get-url", "origin"], at: Library.root).status != 0)
+        }
+
+        var linked = Paper(arxivID: "2510.21600")
+        linked.body = "My existing judgment.\n"
+        linked.connections = ["2401.00001": "Contradicts the assumption: x > 0\nCheck the control."]
+        check("personal connections round-trip", Paper(markdown: linked.markdown)?.connections == linked.connections)
+        let packet = ReadingHandoff(materialID: "source-one", title: "Test paper", origin: "https://arxiv.org/abs/2510.21600", originalPath: "/tmp/test.pdf", annotationID: "test-annotation", page: 4, quote: "The result", note: "Is this controlled?")
+        check("handoff matches existing arXiv review", ReviewHandoff.key(packet) == "2510.21600")
+        check("handoff appends without replacing writing", ReviewHandoff.append(packet, to: &linked) && linked.body.hasPrefix("My existing judgment."))
+        let once = linked.body
+        check("repeated handoff is idempotent", !ReviewHandoff.append(packet, to: &linked) && linked.body == once)
+        check("handoff links to exact source page", linked.body.contains("frontier://source/source-one?page=4"))
+        let other = Paper(arxivID: "2401.00001")
+        check("personal connection appears in both directions", Relations.related(to: linked, in: [linked, other]).first?.kind == .personal && Relations.related(to: other, in: [linked, other]).first?.kind == .personal)
 
         // --- markdown round-trip
         var p = Paper(arxivID: "2510.23966")
@@ -919,16 +980,10 @@ enum SelfTest {
               SortOrder.apply(.unread, to: mixed).last?.arxivID == "c",
               "c is the only one with a note written")
 
-        // --- the graph, on real papers
-        // Whichever of these has PDFs — directories get reorganised, and a test that
-        // silently skips is worse than one that looks somewhere else.
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let candidates = [
-            home.appendingPathComponent("Downloads/ai_safety_papers"),
-            home.appendingPathComponent("Downloads/papers_to_skim"),
-            home.appendingPathComponent("Downloads"),
-            home.appendingPathComponent("Papers")
-        ]
+        // Optional corpus observation. Never assume or scan a user's Downloads folder.
+        let candidates: [URL] = ProcessInfo.processInfo.environment["PAPER_NOTES_TEST_PDFS"].map {
+            [URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)]
+        } ?? []
         var found: [URL] = []
         for dir in candidates {
             let items = (try? FileManager.default.contentsOfDirectory(

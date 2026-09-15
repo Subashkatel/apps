@@ -1,0 +1,14 @@
+{
+  "dataRoot": "~/Library/Application Support",
+  "claudePath": "",
+  "codexPath": "",
+  "codexAuthFile": "",
+  "paperNotesRemote": "",
+  "whisperCLI": "",
+  "whisperModel": "",
+  "voiceConfigDirectory": "~/.config/voicebridge",
+  "frontierReaderProfile": "",
+  "frontierCoursesFile": "",
+  "pomodoroWorkAppsFile": "~/.config/pomodoro/work-apps.txt",
+  "antigravityPath": ""
+}

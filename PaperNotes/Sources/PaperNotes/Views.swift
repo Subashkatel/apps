@@ -1,4 +1,5 @@
 import SwiftUI
+import LocalSupport
 import UniformTypeIdentifiers
 
 /// Two panes with a draggable divider.
@@ -86,6 +87,7 @@ struct ContentView: View {
     /// papers at once; the editor still follows whichever one is the anchor.
     @State private var selection: Set<String> = []
     @State private var query = ""
+    @State private var showingAISettings = false
 
     /// The selection in the order the list shows it, so queuing three papers
     /// reads them top-to-bottom rather than in Set order — which is arbitrary and
@@ -106,6 +108,15 @@ struct ContentView: View {
             statusBar
         }
         .frame(minWidth: 980, minHeight: 600)
+        .background(ReviewTheme.surface).tint(ReviewTheme.accent)
+        .alert("Could not save the note", isPresented: Binding(
+            get: { model.saveError != nil },
+            set: { if !$0 { model.saveError = nil } })) {
+            Button("OK") { model.saveError = nil }
+        } message: {
+            Text((model.saveError ?? "") + " Your draft is still in the editor. Resolve the storage problem and save again before switching papers.")
+        }
+        .sheet(isPresented: $showingAISettings) { PaperAISettingsView() }
         .sheet(isPresented: $model.showingAdd) { AddPaperSheet(model: model) }
         .sheet(isPresented: Binding(get: { model.gradeResult != nil },
                                     set: { if !$0 { model.gradeResult = nil } })) {
@@ -138,35 +149,22 @@ struct ContentView: View {
             // editor where it was rather than flickering between papers.
             if new.count == 1, let id = new.first { model.select(id) }
         }
+        .onChange(of: model.selectedID) { _, id in if let id { selection = [id] } }
         .task { model.bootstrap() }
     }
 
     private var splitView: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            if model.draft != nil { editor } else { placeholder }
-        }
-        // Single-line title, no subtitle: a subtitle makes the macOS title bar two
-        // lines tall without the panes' safe area following.
-        .navigationTitle("Paper Notes")
-        .searchable(text: $query, placement: .sidebar,
-                    prompt: "Title, author, id, or anything you wrote")
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Button { model.showingAdd = true } label: { Label("Add paper", systemImage: "plus") }
-            }
-            ToolbarItem {
+        HSplitView {
+            VStack(spacing: 12) {
+                HStack {
+                    TextField("Search papers & notes", text: $query).textFieldStyle(.roundedBorder)
+                    Button { model.showingAdd = true } label: { Image(systemName: "plus") }.help("Add paper")
+                }.padding(.horizontal, 16).padding(.top, 18)
                 if model.isBusy { ProgressView().controlSize(.small) }
-            }
-            ToolbarItem {
-                if let d = model.draft, !d.pdfPath.isEmpty {
-                    Button { model.startReading(d) } label: {
-                        Label("Read", systemImage: "doc.richtext")
-                    }
-                    .help("Open the PDF and move this window to another display")
-                }
-            }
+                sidebar
+            }.frame(minWidth: 250, idealWidth: 270, maxWidth: 340).background(ReviewTheme.surface)
+            Group { if model.draft != nil { editor } else { placeholder } }
+                .frame(minWidth: 600, maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -174,7 +172,8 @@ struct ContentView: View {
         // Multi-select, because queuing is the one action you want to do to
         // several papers at once. A single id still drives the editor; the wider
         // selection only feeds the context menu.
-        List(selection: $selection) {
+        ScrollView {
+          LazyVStack(alignment: .leading, spacing: 12) {
             Section {
                 Picker("Sort", selection: Binding(
                     get: { model.sort },
@@ -209,7 +208,7 @@ struct ContentView: View {
                             .foregroundStyle(.tertiary)
                         }
                         .padding(.vertical, 1)
-                        .tag(hit.paper.arxivID)
+                        .modifier(ReviewRowSelection(id: hit.paper.arxivID, selection: $selection))
                         .contextMenu { rowMenu(hit.paper) }
                     }
                 }
@@ -225,7 +224,7 @@ struct ContentView: View {
                             Text(p.title.isEmpty ? p.arxivID : p.title)
                                 .font(.system(size: 12)).lineLimit(1)
                         }
-                        .tag(p.arxivID)
+                        .modifier(ReviewRowSelection(id: p.arxivID, selection: $selection))
                         .contextMenu {
                             Button("Remove from queue") { model.unqueue([p.arxivID]) }
                             if !p.pdfPath.isEmpty {
@@ -271,12 +270,14 @@ struct ContentView: View {
                         .foregroundStyle(.tertiary)
                     }
                     .padding(.vertical, 2)
-                    .tag(p.arxivID)
+                    .modifier(ReviewRowSelection(id: p.arxivID, selection: $selection))
                     .contextMenu { rowMenu(p) }
                 }
             }
             }
         }
+          }.padding(14)
+        .background(ReviewTheme.surface)
         .frame(minWidth: 250)
     }
 
@@ -333,47 +334,72 @@ struct EditorPane: View {
     @Bindable var model: AppModel
     @Binding var leftWidth: CGFloat
 
+    @AppStorage("reviewMode") private var mode = "Preview"
+    @State private var toolsExpanded = false
+    @State private var connectionsExpanded = false
+    @State private var showingAISettings = false
+    private var reviewModePicker: some View {
+        Picker("View", selection: $mode) {
+            Text("Write").tag("Write"); Text("Preview").tag("Preview"); Text("Split").tag("Split")
+        }.pickerStyle(.segmented).labelsHidden()
+    }
     var body: some View {
         if let draft = model.draft {
+            HStack(spacing: 0) {
             VStack(spacing: 0) {
-                NoteHeader(model: model, paper: draft)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
-                    .padding(.bottom, 14)
+                NoteHeader(model: model, paper: draft).padding(.horizontal, 28).padding(.vertical, 20)
                 Divider()
-                // Write on the left, see it rendered on the right. Live inline
-                // rendering would fight the text cursor; a split does not.
-                //
-                // Hand-rolled rather than HSplitView: that legacy AppKit container
-                // does not honour the window's safe area, which let the editor slide
-                // up under the title bar.
-                SplitPane(leftWidth: $leftWidth) {
-                    TextEditor(text: Binding(
-                        get: { model.draft?.body ?? "" },
-                        set: { model.draft?.body = $0 }))
-                        .font(.system(size: 12.5, design: .monospaced))
-                        .lineSpacing(2)
-                        .scrollContentBackground(.hidden)
-                        .padding(8)
-                } right: {
-                    MarkdownPreview(markdown: draft.body)
-                }
-                // layoutPriority(1) makes this the one flexible child: it absorbs
-                // whatever the header and related strip leave, and — crucially — is
-                // forced to *accept* that height rather than inflating the VStack
-                // with an ideal size of its own. Without it a greedy child (a web
-                // view reporting its full document height, a text view sized to its
-                // content) makes the stack taller than the window, and the overflow
-                // goes off the top.
-                //
-                // No minHeight here: a floor is exactly what lets it exceed the
-                // window in the first place.
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(1)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("My review").font(.custom("Georgia", size: 17)).fixedSize()
+                        Spacer()
+                        Button(model.showingDiscussion ? "Hide discussion" : "Discuss") { model.showingDiscussion.toggle() }
+                            .fixedSize().accessibilityIdentifier("toggle-discussion")
+                        if !model.showingDiscussion { reviewModePicker.frame(width: 235) }
+                    }
+                    if model.showingDiscussion { reviewModePicker }
+                }.padding(.horizontal, 28).padding(.vertical, 12)
+                GeometryReader { geometry in
+                    HStack(spacing: 0) {
+                        if mode != "Preview" {
+                            TextEditor(text: Binding(get: { model.draft?.body ?? "" }, set: { model.draft?.body = $0 }))
+                                .font(.system(size: 14, design: .monospaced)).lineSpacing(4)
+                                .scrollContentBackground(.hidden).padding(16)
+                                .frame(width: mode == "Split" ? geometry.size.width * 0.5 : geometry.size.width)
+                                .accessibilityIdentifier("review-editor")
+                        }
+                        if mode == "Split" { Divider() }
+                        MarkdownPreview(markdown: draft.body)
+                            .frame(width: mode == "Write" ? 0 : mode == "Split" ? geometry.size.width * 0.5 - 1 : geometry.size.width)
+                            .opacity(mode == "Write" ? 0 : 1).allowsHitTesting(mode != "Write")
+                    }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity).layoutPriority(1)
                 Divider()
-                RelatedPanel(model: model).padding(14)
+                VStack(alignment: .leading, spacing: 12) {
+                    DisclosureGroup("Prompts & review tools", isExpanded: $toolsExpanded) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack {
+                                Menu("Add a review prompt") { ForEach(ReviewPrompt.allCases, id: \.self) { prompt in Button(prompt.rawValue) { model.appendPrompt(prompt) } } }
+                                Spacer()
+                                if model.isGrading { ProgressView().controlSize(.small) }
+                                Button("Grade my note") { model.gradeCurrentNote() }.disabled(model.isGrading || !draft.isSubstantive)
+                            }
+                            NoteHeader(model: model, paper: draft).appraisalRow
+                        }.padding(.top, 10)
+                    }
+                    DisclosureGroup("Connections · \(model.related.count)", isExpanded: $connectionsExpanded) {
+                        ReviewConnections(model: model).padding(.top, 10)
+                    }
+                }.font(.system(size: 12)).padding(.horizontal, 28).padding(.vertical, 14)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(ReviewTheme.surface).tint(ReviewTheme.accent)
+            if model.showingDiscussion {
+                PaperDiscussion(model: model, paper: draft, close: { model.showingDiscussion = false }, configure: { showingAISettings = true })
+                    .id(draft.arxivID).frame(width: 370)
+                    .overlay(alignment: .leading) { Divider() }
+            }
+            }.sheet(isPresented: $showingAISettings) { PaperAISettingsView() }
         }
     }
 }
@@ -386,18 +412,19 @@ extension ContentView {
             if model.unpushed > 0 {
                 Text("\(model.unpushed) unpushed").font(.system(size: 10)).foregroundStyle(.tertiary)
             }
-            Toggle("Push to GitHub", isOn: Binding(
+            Toggle("Push to Git remote", isOn: Binding(
                 get: { Prefs.pushEnabled },
                 set: { Prefs.pushEnabled = $0; if $0 { model.pushIfEnabled() } }))
                 .toggleStyle(.checkbox)
                 .font(.system(size: 10))
+            AISelectionBadge(load: { try PaperAI.load() }, configure: { showingAISettings = true })
             GraphButton()
             OpenWindowButton(id: WindowID.recommend, title: "Next", icon: "sparkles")
             Button("Save") { model.save() }
                 .keyboardShortcut("s", modifiers: .command)
         }
         .padding(.horizontal, 14).padding(.vertical, 7)
-        .background(.bar)
+        .background(ReviewTheme.surface)
     }
 }
 
@@ -406,83 +433,26 @@ struct NoteHeader: View {
     let paper: Paper
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 12) {
             Text(paper.title.isEmpty ? paper.arxivID : paper.title)
-                .font(.system(size: 16, weight: .semibold))
-                // Two lines maximum. A long title would otherwise change the header's
-                // height on every selection and shove the panes below it around.
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
+                .font(.custom("Georgia", size: 26)).lineLimit(2)
+                .frame(height: 66, alignment: .topLeading)
             HStack(spacing: 8) {
-                if !paper.authors.isEmpty {
-                    Text(paper.authors.prefix(3).joined(separator: ", ")
-                         + (paper.authors.count > 3 ? " et al." : ""))
-                        .lineLimit(1)
-                }
-                if let y = paper.year { Text(String(y)) }
-                if !paper.venue.isEmpty { Text(paper.venue).lineLimit(1) }
-                // Keyed off the id's shape: arXiv for arXiv ids, the Anthology for
-                // ACL ids, and no link at all for a hand-made key — a dead link
-                // dressed as a real one is worse than none.
-                if let url = paper.externalURL {
-                    Link(paper.externalLinkLabel, destination: url)
-                }
+                Text(paper.authors.prefix(3).joined(separator: ", ")).lineLimit(1)
+                if let year = paper.year { Text(String(year)) }
+                if let url = paper.externalURL { Link(paper.externalLinkLabel, destination: url) }
                 Spacer()
-            }
-            .font(.system(size: 10))
-            .foregroundStyle(.secondary)
-
-            // Its own row. Six segments have a wide intrinsic width, and sharing the
-            // metadata line meant one of them got clipped — the authors at 620pt,
-            // the picker itself at 700pt.
-            HStack(spacing: 10) {
-                Picker("", selection: Binding(
-                    get: { model.draft?.verdict ?? .unset },
-                    set: { model.draft?.verdict = $0 })) {
-                    ForEach(Verdict.allCases, id: \.self) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .controlSize(.small)
-                .labelsHidden()
-                .fixedSize()
-
-                // The star was reachable only by right-clicking the sidebar, which
-                // meant the recommender's one input was effectively hidden: 0 of 68
-                // papers were starred.
-                Button {
-                    model.toggleStar(paper)
-                } label: {
-                    Image(systemName: paper.starred ? "star.fill" : "star")
-                        .foregroundStyle(paper.starred ? Color(hex: 0xEDA100) : .secondary)
-                }
-                .buttonStyle(.borderless)
-                .help(paper.starred
-                      ? "Starred — counts treble when recommending"
-                      : "Star this paper to pull its references up the recommendations")
-
-                Spacer(minLength: 8)
-
-                if model.isGrading {
-                    ProgressView().controlSize(.small).scaleEffect(0.7)
-                }
-                Button("Grade my note") { model.gradeCurrentNote() }
-                    .controlSize(.small)
-                    .disabled(model.isGrading || !(model.draft?.isSubstantive ?? false))
-                    // Says *why* it is off. A greyed button with no explanation is
-                    // indistinguishable from a broken one.
-                    .help(model.draft?.isSubstantive == true
-                          ? "Reads the paper and tells you what your note missed or overstated"
-                          : "Write a note first — there is nothing to grade yet")
-            }
-            .padding(.top, 2)
-            // The row keeps a fixed height whatever it contains, so selecting a
-            // different paper can never shift the panes below it.
-            .frame(height: 22)
-
-            appraisalRow
-                // Same reason: one line, always, whatever it holds. A reason that
-                // wrapped to two lines on some papers would move the editor.
-                .frame(height: 15)
+            }.font(.system(size: 11)).foregroundStyle(.secondary)
+            HStack(spacing: 12) {
+                Picker("My take", selection: Binding(get: { model.draft?.verdict ?? .unset }, set: { model.draft?.verdict = $0 })) {
+                    ForEach(Verdict.allCases, id: \.self) { Text($0 == .unset ? "Not rated" : $0.rawValue.capitalized).tag($0) }
+                }.pickerStyle(.menu).frame(width: 180)
+                Button { model.toggleStar(paper) } label: { Image(systemName: paper.starred ? "star.fill" : "star") }
+                    .buttonStyle(.plain).help("Star this paper")
+                Spacer()
+                if paper.resolvedPDF != nil { Button("Open PDF ↗") { model.startReading(paper) } }
+                else { Button("Attach PDF…") { model.attachPDF(paper) }.accessibilityIdentifier("attach-pdf") }
+            }.controlSize(.small)
         }
     }
 }
@@ -496,10 +466,10 @@ extension NoteHeader {
             if model.appraising.contains(paper.arxivID) {
                 ProgressView().controlSize(.small).scaleEffect(0.55)
                     .frame(width: 12, height: 12)
-                Text("Claude is reading it…")
+                Text("AI is reading it…")
                     .font(.system(size: 10)).foregroundStyle(.tertiary)
             } else if paper.appraisal != .unset {
-                Text("Claude: \(paper.appraisal.label)")
+                Text("AI appraisal: \(paper.appraisal.label)")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(.secondary)
                 // The position is the honest part. The band is only a coarsening of
@@ -519,7 +489,7 @@ extension NoteHeader {
                         .font(.system(size: 9)).foregroundStyle(.tertiary)
                 }
             } else if !paper.pdfPath.isEmpty && Judge.isAvailable {
-                Button("Ask Claude if it's worth reading") { model.appraise(paper) }
+                Button("Ask AI about this paper") { model.appraise(paper) }
                     .buttonStyle(.link)
                     .font(.system(size: 10))
             }

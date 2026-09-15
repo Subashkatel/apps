@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // right-click → Services menu in Finder.
         NSApp.servicesProvider = ServiceProvider()
         NSUpdateDynamicServices()
+        MainActor.assumeIsolated { ReviewPreview.live() }
         if ProcessInfo.processInfo.environment["PN_DUMP"] == "1" { Diagnose.scheduleDump() }
         if ProcessInfo.processInfo.environment["PN_WINDOWS"] == "1" { Diagnose.scheduleWindowDump() }
     }
@@ -14,7 +15,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Finder's "Open With → Paper Notes", and files opened via `open -a`.
     func application(_ application: NSApplication, open urls: [URL]) {
         MainActor.assumeIsolated {
-            for url in urls { AppModel.shared.ingest(fileURL: url) }
+            for url in urls {
+                if url.scheme == "papernotes" { AppModel.shared.receive(url) } else { AppModel.shared.ingest(fileURL: url) }
+            }
+            Self.mainWindow()?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            let model = AppModel.shared
+            guard model.flushDraft() else { return .terminateCancel }
+            for conversation in model.conversations.values { conversation.retrySave() }
+            guard !model.conversations.values.contains(where: { $0.hasUnsavedChanges }) else {
+                let alert = NSAlert(); alert.messageText = "A conversation could not be saved."
+                alert.informativeText = "Your writing is still open. Retry saving in the discussion before quitting."
+                alert.runModal(); return .terminateCancel
+            }
+            return .terminateNow
         }
     }
 
@@ -70,10 +89,12 @@ final class ServiceProvider: NSObject {
 @main
 struct PaperNotesApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @AppStorage("reviewDarkMode") private var darkMode = true
     @State private var model = AppModel.shared
 
     init() {
         let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--review-preview"), i + 1 < args.count { MainActor.assumeIsolated { ReviewPreview.run(to: args[i + 1]) } }
         if args.contains("--selftest") { MainActor.assumeIsolated { SelfTest.run() } }
         if args.contains("--refresh") { Importer.refresh() }
         if args.contains("--adopt-pdfs") { Importer.adoptPDFs() }
@@ -110,14 +131,14 @@ struct PaperNotesApp: App {
         // Window, not WindowGroup: a WindowGroup is a multi-window scene, so every
         // file opened from Finder spawned another copy of the app's window.
         Window("Paper Notes", id: WindowID.main) {
-            ContentView(model: model)
+            ContentView(model: model).preferredColorScheme(darkMode ? .dark : .light)
         }
         .defaultSize(width: 1120, height: 700)
 
         // Its own window on purpose: with three displays, the graph earns a screen
         // of its own next to the PDF and the notes.
         Window("Citation Graph", id: WindowID.graph) {
-            GraphView(model: model)
+            GraphView(model: model).preferredColorScheme(darkMode ? .dark : .light)
                 .frame(minWidth: 520, minHeight: 420)
         }
         .defaultSize(width: 900, height: 680)
@@ -125,12 +146,14 @@ struct PaperNotesApp: App {
         // Also its own window: choosing what to read next is a separate act from
         // writing about what you just read, and it takes a minute to populate.
         Window("What to Read Next", id: WindowID.recommend) {
-            RecommendationsView(model: model)
+            RecommendationsView(model: model).preferredColorScheme(darkMode ? .dark : .light)
         }
         .defaultSize(width: 640, height: 560)
 
         .commands {
             CommandGroup(after: .newItem) {
+                Toggle("Dark appearance", isOn: $darkMode)
+                Divider()
                 Button("Add Paper…") { model.showingAdd = true }
                     .keyboardShortcut("n", modifiers: .command)
                 Divider()
@@ -145,7 +168,7 @@ struct PaperNotesApp: App {
                 GraphCommand()
                 RecommendCommand()
                 Button("Edit Trusted Authors…") { model.editTrustedAuthors() }
-                Toggle("Appraise New Papers with Claude", isOn: Binding(
+                Toggle("Appraise New Papers with AI", isOn: Binding(
                     get: { Prefs.autoAppraise },
                     set: { Prefs.autoAppraise = $0 }))
                 Button("Rank Library by Interest") { model.rankLibrary() }

@@ -1,3 +1,4 @@
+import LocalSupport
 import Foundation
 
 /// Every sticky, on disk as plain markdown.
@@ -16,8 +17,7 @@ import Foundation
 final class Store {
     static let shared = Store()
 
-    static let root = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Jot")
+    static let root = LocalConfig.dataDirectory("Jot")
 
     /// Where the notes used to live.
     private static let legacyRoot = FileManager.default.homeDirectoryForCurrentUser
@@ -33,7 +33,9 @@ final class Store {
     private init() {}
 
     func bootstrap() {
-        Self.migrateFromHome()
+        if LocalConfig.path("dataRoot", environment: "LOCAL_APPS_DATA_ROOT") == nil {
+            Self.migrateFromHome()
+        }
         try? FileManager.default.createDirectory(at: Self.root, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: Self.trash, withIntermediateDirectories: true)
         reload()

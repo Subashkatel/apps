@@ -8,7 +8,8 @@ struct FrontierApp: App {
 
     init() {
         let args = Array(CommandLine.arguments.dropFirst())
-        if args.contains("--selftest") { MainActor.assumeIsolated { SelfTest.run() } }
+        if let i = args.firstIndex(of: "--preview"), i + 1 < args.count { MainActor.assumeIsolated { ReaderPreview.run(to: URL(fileURLWithPath: args[i + 1])) } }
+        if args.contains("--selftest") || args.contains("--selftest-headless") { MainActor.assumeIsolated { SelfTest.run() } }
         MainActor.assumeIsolated { CLI.run(args) }
         TitlebarZoom.install()
         ZoomDiagnose.scheduleIfAsked()
@@ -23,7 +24,7 @@ struct FrontierApp: App {
         // when added by plain AppKit (FRONTIER_INJECT). The same content in a
         // plain NSWindow + NSHostingView paints (FRONTIER_WEBPROBE probes 2 and
         // 3, toolbar included). Settings is the minimal scene SwiftUI demands.
-        Settings { EmptyView() }
+        Settings { AISettingsView() }
     }
 }
 
@@ -34,7 +35,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = Model()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        FrontierAppearance.apply(UserDefaults.standard.string(forKey: FrontierAppearance.key) ?? "Dark")
         makeWindow()
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls { model.handleSourceURL(url) }
+        window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        for reader in model.pdfReaders.values { if reader.dirty { reader.save() }; reader.saveNoteDraft() }
+        for conversation in model.discussions.values { conversation.retrySave() }
+        guard model.hasUnsavedAnnotations || model.discussions.values.contains(where: { $0.hasUnsavedChanges }) else { return .terminateNow }
+        let alert = NSAlert(); alert.messageText = "Some notes or conversations could not be saved."
+        alert.informativeText = "Your writing is still open. Retry saving in the source reader or discussion before quitting."
+        alert.runModal(); return .terminateCancel
     }
 
     /// The window is created *at* its final frame and never moved before its
@@ -52,6 +67,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let win = NSWindow(contentRect: Self.startingRect(for: mask),
                            styleMask: mask, backing: .buffered, defer: false)
         win.title = "Frontier"
+        win.titlebarAppearsTransparent = true
+        win.backgroundColor = NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                ? NSColor(srgbRed: 35/255, green: 37/255, blue: 33/255, alpha: 1)
+                : NSColor(srgbRed: 247/255, green: 245/255, blue: 239/255, alpha: 1)
+        }
+        win.contentMinSize = NSSize(width: 820, height: 580)
         // One curriculum, one window; closing hides rather than deallocates,
         // so a Dock click brings the same window back.
         win.isReleasedWhenClosed = false

@@ -1,27 +1,18 @@
 #!/bin/bash
-# Builds and installs the apps. With no arguments, all of them.
-#
-# Each app's build.sh does the real work and also launches what it built, which
-# is why this stops at the first failure rather than carrying on: a half-built
-# set of menu-bar apps is worse than none, because the ones that did install
-# look like everything worked.
+# Build and install selected apps. Launch only when --launch is passed.
 set -euo pipefail
 cd "$(dirname "$0")"
-
-apps=("$@")
-if [ ${#apps[@]} -eq 0 ]; then
-  apps=(CodingAgentUsage Frontier Jot PaperNotes Pomodoro VoiceBridge)
-fi
-
-for app in "${apps[@]}"; do
-  if [ ! -x "$app/build.sh" ]; then
-    echo "no such app: $app" >&2
-    exit 1
-  fi
-  echo "==> $app"
-  ( cd "$app" && ./build.sh )
+apps=()
+launch=1
+for arg in "$@"; do
+  case "$arg" in
+    --launch) launch=0;;
+    CodingAgentUsage|Frontier|Jot|MeetingNotes|PaperNotes|Pomodoro|VoiceBridge) apps+=("$arg");;
+    *) echo "Usage: ./install.sh [--launch] [CodingAgentUsage Frontier Jot MeetingNotes PaperNotes Pomodoro VoiceBridge]" >&2; exit 1;;
+  esac
 done
-
-echo
-echo "Done. Menu-bar apps show no Dock icon — look in the menu bar."
-echo "VoiceBridge needs Accessibility permission; Jot's hotkeys do not."
+[ ${#apps[@]} -ne 0 ] || apps=(CodingAgentUsage Frontier Jot MeetingNotes PaperNotes Pomodoro VoiceBridge)
+for app in "${apps[@]}"; do
+  INSTALL=1 NO_LAUNCH="$launch" "$app/build.sh"
+done
+echo "Installed in ${INSTALL_DIR:-/Applications}."

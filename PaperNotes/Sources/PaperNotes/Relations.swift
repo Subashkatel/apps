@@ -3,6 +3,7 @@ import Foundation
 /// Why two papers are connected. Shown verbatim to the reader — an edge you can't
 /// explain is an edge you won't trust.
 enum RelationKind: String {
+    case personal
     case cites            // this paper cites the other
     case citedBy          // the other cites this one
     case coupling         // shared references — the connectedpapers signal
@@ -10,6 +11,7 @@ enum RelationKind: String {
 
     var weight: Double {
         switch self {
+        case .personal: return 1.1
         case .cites, .citedBy: return 1.0
         case .coupling: return 0.7
         case .topical: return 0.3
@@ -23,11 +25,13 @@ struct Relation: Identifiable {
     /// Shared references, for `coupling`.
     let shared: Int
     let score: Double
+    var reason: String = ""
 
     var id: String { other.arxivID + kind.rawValue }
 
     var explanation: String {
         switch kind {
+        case .personal: return "Your connection: " + reason
         case .cites: return "cites this"
         case .citedBy: return "cited by this"
         case .coupling: return "shares \(shared) reference\(shared == 1 ? "" : "s")"
@@ -75,6 +79,9 @@ enum Relations {
         }
 
         for other in library where PDFRefs.normalise(other.arxivID) != myID {
+            if let reason = paper.connections[other.id] ?? other.connections[paper.id] {
+                offer(Relation(other: other, kind: .personal, shared: 0, score: RelationKind.personal.weight, reason: reason))
+            }
             let theirs = Set(other.refs.map(PDFRefs.normalise))
             let theirID = PDFRefs.normalise(other.arxivID)
 

@@ -1,3 +1,4 @@
+import LocalSupport
 import Foundation
 
 /// The `claude` CLI, used to grow the curriculum and to write it.
@@ -12,101 +13,31 @@ import Foundation
 /// not sure of to be marked rather than smoothed over. The reader then has
 /// somewhere to go when a line smells off.
 enum Tutor {
-    static var cliPath: String? {
-        let candidates = [
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".local/bin/claude").path,
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude",
-        ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    static var configurationError: String? {
+        do { _ = try AISettings.load().validated(); return nil }
+        catch { return error.localizedDescription }
     }
-
-    static var isAvailable: Bool { cliPath != nil }
-
-    /// Reports how long it took and why it stopped, because a silent nil
-    /// after four minutes is indistinguishable from a broken CLI.
+    static var isAvailable: Bool { configurationError == nil }
     static var lastError: String?
 
     static func ask(_ prompt: String, timeout: TimeInterval = 600) -> String? {
-        let started = Date()
-        guard let cli = cliPath else { return nil }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: cli)
-        // Tools off, explicitly.
-        //
-        // Left on, the CLI decides it wants to read a file or run a command to
-        // check something, and in a nested session those calls never return —
-        // the same prompt hung for twenty minutes and then answered in seventy
-        // seconds with this flag. Nothing here needs a tool: the model is being
-        // asked what it knows, and the app checks the links itself afterwards.
-        p.arguments = ["-p", "--disallowedTools",
-                       "WebSearch,WebFetch,Bash,Read,Write,Edit,Glob,Grep,Task,NotebookEdit"]
-
-        let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
-        p.standardInput = stdin
-        p.standardOutput = stdout
-        p.standardError = stderr
-        do { try p.run() } catch { lastError = "could not launch \(cli)"; return nil }
-        stdin.fileHandleForWriting.write(Data(prompt.utf8))
-        stdin.fileHandleForWriting.closeFile()
-
-        // Both pipes are drained, each on its own queue.
-        //
-        // A pipe nobody reads holds 64 KB and then blocks the writer forever.
-        // Draining stdout alone is not enough: this hung for the full ten-minute
-        // timeout on longer prompts while a one-line prompt returned in three
-        // seconds, because the difference was how much the CLI had written to
-        // *stderr* before it blocked.
-        var output = Data(), errors = Data()
-        let lock = NSLock()
-        let group = DispatchGroup()
-        DispatchQueue(label: "tutor.out").async(group: group) {
-            let data = stdout.fileHandleForReading.readDataToEndOfFile()
-            lock.lock(); output = data; lock.unlock()
-        }
-        DispatchQueue(label: "tutor.err").async(group: group) {
-            let data = stderr.fileHandleForReading.readDataToEndOfFile()
-            lock.lock(); errors = data; lock.unlock()
-        }
-        let deadline = Date().addingTimeInterval(timeout)
-        while p.isRunning, Date() < deadline { usleep(100_000) }
-        if p.isRunning {
-            p.terminate()
-            lastError = "timed out after \(Int(timeout))s"
+        do {
+            let settings = try AISettings.load()
+            let reply = try AIClient.ask(prompt, settings: settings, timeout: timeout)
+            lastError = nil
+            return reply
+        } catch {
+            lastError = error.localizedDescription
             return nil
         }
-        p.waitUntilExit()
-        // Wait for the readers rather than sleeping and hoping.
-        _ = group.wait(timeout: .now() + 10)
-        lock.lock(); let data = output; let errorData = errors; lock.unlock()
-        let text = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let seconds = Int(Date().timeIntervalSince(started))
-        if text?.isEmpty ?? true {
-            let err = String(data: errorData, encoding: .utf8) ?? ""
-            lastError = "empty reply after \(seconds)s"
-                + (err.isEmpty ? "" : " — \(err.prefix(200))")
-            return nil
-        }
-        lastError = "answered in \(seconds)s"
-        return text
     }
 
-    /// Who this is for. Prepended to every prompt, because "explain paged
-    /// attention" to a first-year and to someone who works on LLM safety are
-    /// different requests, and the second one is the only one worth writing.
-    static let reader = """
-        The reader is a computer science PhD student working on empirical LLM \
-        safety — reasoning-model robustness, misalignment, self-improvement, \
-        chain-of-thought monitorability. Strong maths and theory background. \
-        They train and serve models and want to understand the systems and \
-        hardware underneath rigorously, not by analogy. Assume they know \
-        transformers, attention, standard optimisation, and PyTorch. Do not \
-        explain those. Assume they do not know internals they have never had to \
-        implement — GPU memory hierarchy, kernel scheduling, collective \
-        communication, serving internals — unless the graph says otherwise.
-        """
+    /// Optional user-supplied background for generated explanations.
+    static var reader: String {
+        if let url = LocalConfig.path("frontierReaderProfile", environment: "FRONTIER_READER_PROFILE"),
+           let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty { return text }
+        return "Explain the topic clearly. Use the curriculum and prerequisites to determine the reader’s background; do not assume a profession or research specialty."
+    }
 
     // MARK: - Growing the graph
 
@@ -424,10 +355,8 @@ enum Tutor {
             .compactMap { id in context.first { $0.id == id }?.title }
             .joined(separator: ", ")
         let prompt = """
-            You are teaching one concept to a strong reader who has no background \
-            in this particular area. They are a computer science PhD student — \
-            they are not slow, and they will notice if you wave your hands. They \
-            simply have not worked on this, and every unexplained term is a wall.
+            \(reader)
+            Teach this concept clearly, introducing unfamiliar terms and making each step explicit.
 
             Concept: \(concept.title)
             \(concept.relevance.isEmpty ? "" : "Why it is on their list: \(concept.relevance)")
@@ -509,9 +438,7 @@ enum Tutor {
             (the mechanism, concretely)
 
             ## Why it matters for your work
-            (specific to LLM safety research — how it changes what they can measure, \
-            train, or trust. Say plainly if the honest answer is "mostly it does not, \
-            but you will hit it when...")
+            (connect it to the supplied reader background and curriculum; do not invent a specialty.)
 
             ## Check yourself
             (2-3 questions with short answers, testing the mechanism rather than the vocabulary)

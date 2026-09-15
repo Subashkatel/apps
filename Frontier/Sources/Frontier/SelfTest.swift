@@ -24,6 +24,8 @@ enum SelfTest {
             return c
         }
 
+        SourceTests.run(check)
+
         // --- file round-trip
         var c = Concept(id: "paged-attention", title: "Paged Attention")
         c.area = .systems
@@ -202,6 +204,14 @@ enum SelfTest {
               "got \(parts.count) batches, second titled \(parts[1].first?.title ?? "-")")
         check("no batch exceeds the cap",
               parts.allSatisfy { $0.reduce(0) { $0 + $1.text.count } <= 10_000 })
+
+        ImportTests.run(check)
+        LibraryTests.run(check)
+        RemovalTests.run(check)
+        if CommandLine.arguments.contains("--selftest-headless") {
+            print(fails == 0 ? "\nALL PASS" : "\n\(fails) FAILURE(S)")
+            exit(fails == 0 ? 0 : 1)
+        }
 
         // --- the reading pane actually typesets the mathematics
         //

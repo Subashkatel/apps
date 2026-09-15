@@ -1,14 +1,19 @@
 #!/bin/bash
-# Builds Stickies.app and installs it to /Applications.
+# Builds Jot.app; INSTALL=1 enables installation.
 set -euo pipefail
 cd "$(dirname "$0")"
+INSTALL_DIR="${INSTALL_DIR:-/Applications}"
 
 EXEC="Jot"
 APP="Jot"
-BUNDLE="build/$APP.app"
+BUNDLE="${APP_BUILD_ROOT:-$HOME/Library/Caches/LocalApps/Builds}/$APP.app"
 
 echo "==> Compiling"
-swift build -c release
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$PWD/.build/ModuleCache}"
+export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$CLANG_MODULE_CACHE_PATH}"
+swift_args=(-c release --jobs "${SWIFT_JOBS:-2}" --cache-path "$PWD/.build/spm-cache")
+[ "${SWIFT_DISABLE_SANDBOX:-0}" != "1" ] || swift_args+=(--disable-sandbox)
+swift build "${swift_args[@]}"
 
 echo "==> Rendering icon"
 rm -rf build/AppIcon.iconset
@@ -45,21 +50,52 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Finder metadata copied into generated bundles prevents macOS code signing.
+xattr -cr "$BUNDLE"
+plutil -lint "$BUNDLE/Contents/Info.plist" >/dev/null
+
 # Same identity the other local apps use. Ad-hoc signing produces a cdhash
 # requirement that changes on every rebuild, which invalidates permissions.
-IDENTITY="VoiceBridge Local Signing"
-if security find-identity -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
-  codesign --force --sign "$IDENTITY" --identifier local.jot "$BUNDLE" 2>&1 | grep -v "replacing existing" || true
+IDENTITY="${SIGNING_IDENTITY:-}"
+if [ -n "$IDENTITY" ]; then
+  codesign --force --sign "$IDENTITY" --identifier local.jot "$BUNDLE"
 else
-  codesign --force --sign - "$BUNDLE" >/dev/null 2>&1
+  codesign --force --sign - "$BUNDLE"
 fi
 
-echo "==> Installing to /Applications"
-pkill -f "/Applications/$APP.app/Contents/MacOS/$EXEC" 2>/dev/null || true
-sleep 0.4
-rm -rf "/Applications/$APP.app"
-cp -R "$BUNDLE" "/Applications/$APP.app"
+codesign --verify --deep --strict "$BUNDLE"
 
-echo "==> Launching"
-open -a "/Applications/$APP.app"
-echo "Done. Notes live in ~/Library/Application Support/Jot as plain markdown."
+if [ "${INSTALL:-0}" != "1" ]; then
+  echo "Built: $BUNDLE"
+  exit 0
+fi
+mkdir -p "$INSTALL_DIR"
+echo "==> Installing to $INSTALL_DIR"
+pkill -f "$INSTALL_DIR/$APP.app/Contents/MacOS/$EXEC" 2>/dev/null || true
+sleep 0.4
+STAGED=$(mktemp -d "$INSTALL_DIR/.local-app-install.XXXXXX")
+cleanup_install() {
+  if [ -e "$STAGED/previous.app" ] && [ ! -e "$INSTALL_DIR/$APP.app" ]; then
+    if ! mv "$STAGED/previous.app" "$INSTALL_DIR/$APP.app"; then
+      echo "Previous app preserved at $STAGED/previous.app; restore it manually." >&2
+      return
+    fi
+  fi
+  rm -rf "$STAGED"
+}
+trap cleanup_install EXIT
+cp -R "$BUNDLE" "$STAGED/$APP.app"
+xattr -cr "$STAGED/$APP.app"
+codesign --verify --deep --strict "$STAGED/$APP.app"
+if [ -e "$INSTALL_DIR/$APP.app" ]; then
+  mv "$INSTALL_DIR/$APP.app" "$STAGED/previous.app"
+fi
+if ! mv "$STAGED/$APP.app" "$INSTALL_DIR/$APP.app"; then
+  exit 1
+fi
+
+if [ "${NO_LAUNCH:-1}" != "1" ]; then
+  echo "==> Launching"
+  open -a "$INSTALL_DIR/$APP.app"
+fi
+echo "Done. Notes are stored separately from the app; see dataRoot in the README."

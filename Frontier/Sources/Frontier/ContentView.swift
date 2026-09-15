@@ -1,16 +1,27 @@
 import AppKit
 import SwiftUI
+import LocalSupport
 import UniformTypeIdentifiers
 
 struct ContentView: View {
     @ObservedObject var model: Model
+    var loadsOnAppear = true
+    var previewGraphHover: String? = nil
     /// Remembered: which view you were last in is a preference, not a mode you
     /// should have to re-pick every launch.
-    @AppStorage("frontier.showGraph") private var showGraph = false
+    private var showGraph: Bool { model.screen == .graph }
     /// Which rendering of the concept you are reading. Remembered, because it
     /// is how you like to read rather than a per-concept choice.
     @AppStorage("frontier.walkthrough") private var walkedThrough = true
+    @AppStorage(FrontierAppearance.key) private var appearance = "Dark"
+    @AppStorage("frontier.sidebarVisible") private var sidebarVisible = true
+    @State private var visitedRead = false
+    @State private var visitedGraph = false
+    @State private var expandedCourses: Set<String> = []
+    @State private var sidebarTitles: [String: String] = [:]
+    @State private var courseGroups: [CourseGroup] = []
     @State private var showingImport = false
+    @State private var showingAISettings = false
 
     /// FRONTIER_BARE=1/2/3 — content bisection levels for the compositing hunt.
     private var bareLevel: Int {
@@ -38,7 +49,21 @@ struct ContentView: View {
                 realBody
             }
         }
-        .onAppear { model.load(); ClickDiagnose.scheduleIfAsked(model: model) }
+        .onAppear {
+            if loadsOnAppear { FrontierAppearance.apply(appearance); model.load() }
+            refreshSidebar()
+            visitedRead = model.screen == .read; visitedGraph = model.screen == .graph
+            ClickDiagnose.scheduleIfAsked(model: model)
+        }
+        .onChange(of: model.showingDiscussion) { _, showing in
+            if showing { model.pdfReaders.values.forEach { $0.showingNotes = false } }
+        }
+        .onChange(of: model.concepts) { _, _ in refreshSidebar() }
+        .onChange(of: appearance) { _, new in if loadsOnAppear { FrontierAppearance.apply(new) } }
+        .onChange(of: model.screen) { _, new in
+            if new == .read { visitedRead = true }
+            if new == .graph { visitedGraph = true }
+        }
         // FRONTIER_OVERLAY=1 — the same renderer, same window, *outside* the
         // split view's detail column. Paints here + blank in the pane = the
         // column; blank here too = the whole window cannot composite it.
@@ -49,6 +74,7 @@ struct ContentView: View {
                     .border(.red)
             }
         }
+        .sheet(isPresented: $showingAISettings) { AISettingsView() }
         .sheet(isPresented: $showingImport) { ImportSheet(model: model) }
         .alert("Frontier", isPresented: .constant(model.note != nil)) {
             Button("OK") { model.note = nil }
@@ -63,118 +89,216 @@ struct ContentView: View {
         VStack(spacing: 0) {
             controlBar
             Divider()
-            // A hand-rolled split. NavigationSplitView re-blanked the pane even
-            // in a cleanly-created window — it restores column state during
-            // setup, which resizes the window before its first commit, the
-            // exact move that kills out-of-process compositing (see App.swift).
-            HStack(spacing: 0) {
-                sidebar
-                    .frame(width: 280)
-                Divider()
-                Group {
-                    if showGraph {
-                        ConceptGraphView(model: model)
-                    } else if let concept = model.current {
-                        reading(concept)
-                    } else {
-                        empty
+            ZStack {
+                LibraryView(model: model, add: { showingImport = true })
+                    .opacity(model.screen == .library ? 1 : 0)
+                    .allowsHitTesting(model.screen == .library)
+                    .accessibilityHidden(model.screen != .library)
+                if visitedRead || visitedGraph {
+                    HStack(spacing: 0) {
+                        if sidebarVisible {
+                            sidebar.frame(width: 260)
+                            LibraryTheme.rule.frame(width: 1)
+                        }
+                        ZStack {
+                            if visitedRead {
+                                HStack(spacing: 0) {
+                                    readingWorkspace
+                                    if model.showingDiscussion {
+                                        FrontierDiscussion(model: model, configure: { showingAISettings = true })
+                                            .id(model.discussionID).frame(width: 360)
+                                            .overlay(alignment: .leading) { LibraryTheme.rule.frame(width: 1) }
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .opacity(model.screen == .read ? 1 : 0)
+                                .allowsHitTesting(model.screen == .read)
+                                .accessibilityHidden(model.screen != .read)
+                            }
+                            if visitedGraph {
+                                ConceptGraphView(model: model, isActive: model.screen == .graph, previewHoveredID: previewGraphHover)
+                                    .opacity(model.screen == .graph ? 1 : 0)
+                                    .allowsHitTesting(model.screen == .graph)
+                                    .accessibilityHidden(model.screen != .graph)
+                            }
+                        }
                     }
+                    .opacity(model.screen == .library ? 0 : 1)
+                    .allowsHitTesting(model.screen != .library)
+                    .accessibilityHidden(model.screen == .library)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .transaction { $0.animation = nil }
+        .font(.system(size: 13))
+        .foregroundStyle(LibraryTheme.ink)
+        .buttonStyle(LibrarySecondaryButton())
+        .background(LibraryTheme.paper)
+        .tint(LibraryTheme.accent)
+    }
+
+    @ViewBuilder private var learningContent: some View {
+        if let explanation = model.passageExplanation { ConceptPreview(markdown: explanation) }
+        else if let material = model.readingMaterial {
+            if let concept = model.current, model.lessons(for: material).contains(where: { $0.id == concept.id }) { reading(concept) }
+            else if let first = model.lessons(for: material).first { reading(first) }
+            else { walkthroughStart(material) }
+        } else if let concept = model.current { reading(concept) }
+        else { empty }
+    }
+    private var readingWorkspace: some View {
+        VStack(spacing: 0) {
+            if let item = model.activeMaterial {
+                ViewThatFits(in: .horizontal) {
+                    HStack { readingControls(item); Spacer(minLength: 0) }
+                    VStack(alignment: .leading, spacing: 8) { readingControls(item) }
+                }.padding(.horizontal, 18).padding(.vertical, 12)
+                Divider()
+                if model.readingMode == .source { MaterialSource(model: model, item: item) }
+                else if model.readingMode == .compare {
+                    HSplitView {
+                        learningContent.frame(minWidth: 260, maxWidth: .infinity)
+                        MaterialSource(model: model, item: item).frame(minWidth: 380, maxWidth: .infinity)
+                    }
+                } else if model.readingMode == .walkthrough { learningContent }
+                else { MaterialReader(model: model, material: item).id(item.id) }
+            } else { learningContent }
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder private func readingControls(_ item: LibraryMaterial) -> some View {
+        HStack(spacing: 6) {
+            ForEach([Model.ReadingMode.learn, .source, .walkthrough], id: \.self) { mode in
+                Button { model.readingMaterialID = item.id; model.readingMode = mode } label: {
+                    Text(mode.rawValue).font(.system(size: 12)).padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(model.readingMode == mode ? LibraryTheme.chrome : .clear, in: .rect(cornerRadius: 5))
+                }.buttonStyle(.plain).accessibilityIdentifier("reading-mode-" + (mode == .learn ? "read" : mode == .source ? "source" : "walkthrough"))
+                    .accessibilityAddTraits(model.readingMode == mode ? [.isSelected] : [])
+            }
+            Menu {
+                Button("Walkthrough beside original") { model.readingMode = .compare }
+                Button("Open original externally") { if let url = MaterialStore.live.existingOriginal(item) { NSWorkspace.shared.open(url) } }
+            } label: { Image(systemName: "ellipsis") }.menuIndicator(.hidden).fixedSize().help("Reading options")
+        }
+    }
+    private func walkthroughStart(_ material: LibraryMaterial) -> some View {
+        VStack(alignment: .leading, spacing: 20) {
+            Text("Understand this material").font(.custom("Georgia", size: 28)).accessibilityIdentifier("material-learning-start")
+            Text("Build a guided explanation of the concepts, background and notation. Your original remains available to read and annotate.")
+                .foregroundStyle(LibraryTheme.muted).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Generate walkthrough lessons") { model.importResource(material.loaded, materialID: material.id) }
+                    .disabled(model.busy != nil || material.sections.isEmpty).buttonStyle(LibraryPrimaryButton())
+                Button("Ask a question") { model.showingDiscussion = true }.accessibilityIdentifier("material-ask-question")
+            }
+            Text("Uses your selected AI only when requested.").font(.caption).foregroundStyle(LibraryTheme.muted)
+            Spacer()
+        }.padding(30).frame(maxWidth: 650, maxHeight: .infinity, alignment: .topLeading)
     }
 
     // MARK: - Control bar
 
     private var controlBar: some View {
-        HStack(spacing: 10) {
-            Picker("", selection: $showGraph) {
-                Label("Read", systemImage: "text.alignleft").tag(false)
-                Label("Graph", systemImage: "point.3.connected.trianglepath.dotted").tag(true)
+        HStack(spacing: 18) {
+            if model.screen != .library {
+                Button { sidebarVisible.toggle() } label: { Image(systemName: "sidebar.left") }
+                    .help(sidebarVisible ? "Hide sidebar" : "Show sidebar")
+                    .accessibilityLabel(sidebarVisible ? "Hide sidebar" : "Show sidebar")
+                    .accessibilityIdentifier("toggle-sidebar")
+                    .keyboardShortcut("s", modifiers: [.command, .control])
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 160)
-            .help("Read today's concept, or see the whole graph")
-
             Spacer()
-
-            // A whole resource — a book, a course PDF, a long post — turned
-            // into chained concepts and walked through end to end.
-            Button { showingImport = true } label: {
-                if model.busy == "import" {
-                    HStack(spacing: 5) {
-                        ProgressView().controlSize(.small)
-                        Text(model.importProgress ?? "Importing…").lineLimit(1)
-                    }
-                } else {
-                    Label("Import course", systemImage: "square.and.arrow.down")
+            HStack(spacing: 3) {
+                ForEach(Array(Model.Screen.allCases.enumerated()), id: \.element) { index, screen in
+                    Button { model.screen = screen } label: {
+                        Text(screen.rawValue).font(.system(size: 12)).padding(.horizontal, 17).padding(.vertical, 6)
+                            .background(model.screen == screen ? LibraryTheme.chrome : .clear, in: .rect(cornerRadius: 4))
+                    }.buttonStyle(.plain).keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+                        .accessibilityAddTraits(model.screen == screen ? [.isSelected] : [])
                 }
+            }.padding(3).overlay(RoundedRectangle(cornerRadius: 7).stroke(LibraryTheme.rule, lineWidth: 1))
+            Spacer()
+            if model.busy != nil {
+                ProgressView().controlSize(.small)
+                Text(model.importProgress ?? "Working…").font(.caption).lineLimit(1).frame(maxWidth: 180)
             }
-            .help("Turn a whole book, course PDF, or long post into concepts and learn it end to end")
-            .disabled(model.busy != nil)
-
-            // Named, not just an icon. It spends a minute or two asking for
-            // new concepts, which is not something to discover by pressing
-            // an unlabelled button and waiting.
-            Button { model.grow() } label: {
-                if model.busy == "grow" {
-                    HStack(spacing: 5) {
-                        ProgressView().controlSize(.small)
-                        Text("Extending…")
-                    }
-                } else {
-                    Label("Extend graph", systemImage: "plus.diamond")
-                }
+            if model.screen == .graph {
+                Button("Extend graph") { model.grow() }.disabled(model.busy != nil)
             }
-            .help("Ask for more concepts — fills gaps in the graph first. Takes a minute or two.")
-            .disabled(model.busy != nil)
+            if model.screen != .library {
+                Button { showingImport = true } label: { Image(systemName: "plus") }.help("Add material")
+            }
+            if model.screen == .read {
+                Button(model.showingDiscussion ? "Hide discussion" : "Discuss") { model.showingDiscussion.toggle() }
+            }
+            AISelectionBadge(load: { try AISettings.load() }, configure: { showingAISettings = true })
+                .disabled(model.busy != nil)
         }
-        .controlSize(.small)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 24).padding(.vertical, 13)
+        .background(LibraryTheme.paper)
     }
 
     // MARK: - Sidebar
 
     private var sidebar: some View {
-        // One membership set, not a nested `session` recomputation per row —
-        // that pattern cost ~100 ms per click once the graph reached 275
-        // concepts, because session walks the whole dependency graph.
-        let todayIDs = Set(model.session.map(\.id))
-        return List(selection: $model.selected) {
-            Section("Today") {
-                ForEach(model.session) { row($0) }
-            }
-            Section("Ready — \(model.ready.count)") {
-                ForEach(model.ready.filter { !todayIDs.contains($0.id) }
-                            .prefix(20)) { row($0) }
-            }
-            // Every imported or followed course, as the whole path in its own
-            // reading order. This is where "where is the RLHF book and how do
-            // I get through it" is answered — Today and Ready gate what to do
-            // this morning, but the road itself was invisible before this.
-            Section("Courses") {
-                ForEach(courseGroups, id: \.name) { group in
-                    DisclosureGroup {
-                        ForEach(group.concepts) { row($0) }
-                    } label: {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(group.name)
-                                .font(.system(size: 11, weight: .medium)).lineLimit(1)
-                            Text("\(group.done) of \(group.concepts.count) learned")
-                                .font(.system(size: 9)).foregroundStyle(.tertiary)
+        let today = model.session
+        let todayIDs = Set(today.map(\.id))
+        let ready = model.ready.filter { !todayIDs.contains($0.id) }
+        let known = model.concepts.filter(\.isKnown)
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 24) {
+                if !today.isEmpty {
+                    sidebarSection("Today", count: today.count) { ForEach(today) { row($0) } }
+                }
+                if !ready.isEmpty {
+                    sidebarSection("Ready", count: ready.count) { ForEach(ready.prefix(20)) { row($0) } }
+                }
+                if !courseGroups.isEmpty {
+                    sidebarSection("Courses", count: courseGroups.count) {
+                        ForEach(courseGroups, id: \.name) { group in
+                            LazyVStack(alignment: .leading, spacing: 6) {
+                                Button {
+                                    if !expandedCourses.insert(group.name).inserted { expandedCourses.remove(group.name) }
+                                } label: {
+                                    HStack(alignment: .top, spacing: 8) {
+                                        Image(systemName: expandedCourses.contains(group.name) ? "chevron.down" : "chevron.right")
+                                            .font(.system(size: 9, weight: .medium)).frame(width: 10).padding(.top, 4)
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            Text(group.name).font(.system(size: 12)).lineLimit(3)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                            Text("\(group.done) of \(group.concepts.count) learned")
+                                                .font(.system(size: 10)).foregroundStyle(LibraryTheme.muted)
+                                        }
+                                        Spacer(minLength: 0)
+                                    }.padding(.horizontal, 10).padding(.vertical, 7).contentShape(Rectangle())
+                                }.buttonStyle(.plain)
+                                    .accessibilityIdentifier("course-" + group.name)
+                                    .accessibilityValue(expandedCourses.contains(group.name) ? "Expanded" : "Collapsed")
+                                if expandedCourses.contains(group.name) {
+                                    ForEach(group.concepts) { row($0) }
+                                }
+                            }
                         }
                     }
                 }
-            }
-            Section("Known — \(model.concepts.filter(\.isKnown).count)") {
-                ForEach(model.concepts.filter(\.isKnown).prefix(20)) { row($0) }
-            }
+                if !known.isEmpty {
+                    sidebarSection("Known", count: known.count) { ForEach(known.prefix(20)) { row($0) } }
+                }
+            }.padding(.horizontal, 12).padding(.vertical, 22)
         }
-        .listStyle(.inset)
+        .background(LibraryTheme.paper)
+    }
+
+    private func sidebarSection<Content: View>(_ title: String, count: Int,
+                                               @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Text(title).font(.system(size: 11, weight: .medium))
+                Text("\(count)").font(.system(size: 10)).opacity(0.7)
+            }.foregroundStyle(LibraryTheme.muted).padding(.horizontal, 10)
+            content()
+        }
     }
 
     private struct CourseGroup {
@@ -187,12 +311,19 @@ struct ContentView: View {
     /// added — which for an imported resource is its own reading order, front
     /// to back. Mark what you already know from the top and the frontier walks
     /// the rest of it in sequence.
-    private var courseGroups: [CourseGroup] {
+    private func refreshSidebar() {
+        sidebarTitles = Dictionary(uniqueKeysWithValues: model.concepts.map { ($0.id, $0.plainTitle) })
+        courseGroups = makeCourseGroups()
+    }
+
+    private func makeCourseGroups() -> [CourseGroup] {
         var byCourse: [String: [Concept]] = [:]
         for c in model.concepts {
             for name in c.courses { byCourse[name, default: []].append(c) }
         }
+        let hidden = Set(((try? RemovedMaterial.load()) ?? []).map(\.id))
         return byCourse
+            .filter { !hidden.contains(LibraryMaterial.courseID($0.key)) }
             .filter { $0.value.count >= 3 }
             .map { name, list in
                 let ordered = list.sorted {
@@ -205,17 +336,29 @@ struct ContentView: View {
     }
 
     private func row(_ c: Concept) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 5) {
-                Circle().fill(colour(c)).frame(width: 6, height: 6)
-                Text(c.plainTitle).font(.system(size: 12))
-                    .lineLimit(1)
+        let title = sidebarTitles[c.id] ?? c.title
+        let selected = model.screen == .graph ? model.graphFocus == c.id : model.selected == c.id && model.readingMaterialID == nil
+        return Button {
+            if model.screen == .graph { model.selectGraphConcept(c.id) } else { model.openLesson(c) }
+        } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Circle().fill(selected ? LibraryTheme.accent : colour(c))
+                    .frame(width: 5, height: 5).padding(.top, 6)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(title).font(.system(size: 12)).lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(c.area.label).font(.system(size: 10)).foregroundStyle(LibraryTheme.muted)
+                }
+                Spacer(minLength: 0)
             }
-            Text(c.area.label.uppercased())
-                .font(.system(size: 8, weight: .semibold)).tracking(0.5)
-                .foregroundStyle(.tertiary)
-        }
-        .tag(c.id)
+            .padding(.horizontal, 10).padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? LibraryTheme.accent.opacity(0.10) : .clear, in: .rect(cornerRadius: 6))
+            .contentShape(Rectangle())
+        }.buttonStyle(.plain)
+            .accessibilityAddTraits(selected ? [.isSelected] : [])
+            .accessibilityIdentifier("concept-row-" + c.id)
+            .help(title)
     }
 
     private func colour(_ c: Concept) -> Color {
@@ -229,13 +372,8 @@ struct ContentView: View {
     // MARK: - Reading
 
     private func reading(_ concept: Concept) -> some View {
-        // The entry fills the pane and scrolls itself.
-        //
-        // It used to be a fixed-width column inside a SwiftUI ScrollView, which
-        // left it a narrow strip in the top-left corner of a fullscreen window,
-        // and the web view — asked for its size inside a scroll view, where the
-        // proposal is unbounded — fell back to a few hundred points and clipped
-        // the entry. The renderer scrolls perfectly well on its own.
+        // Written entries own their viewport. Introductions are measured into
+        // a shared scroll flow so the native action immediately follows them.
         VStack(alignment: .leading, spacing: 0) {
             if !concept.requires.isEmpty {
                 Text("rests on " + concept.requires.joined(separator: " · "))
@@ -268,30 +406,26 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
             } else {
-                // Unwritten: the heading and the reason it is on the list, then
-                // the offer to write it — where you are looking, not stranded at
-                // the bottom of an empty pane below a hundred points of nothing.
-                VStack(alignment: .leading, spacing: 0) {
-                    ConceptPreview(markdown: document(concept))
-                        .frame(height: 150)
-                    unwritten(concept)
-                    Spacer(minLength: 0)
-                }
+                IntroductionPage(markdown: document(concept)) { unwritten(concept) }
+
+
             }
 
             Divider()
             HStack(spacing: 10) {
-                Button("I know this") { model.mark(concept, .known) }
-                    .disabled(concept.isKnown)
-                Button("Still learning") { model.mark(concept, .learning) }
-                Spacer()
                 if !concept.sources.isEmpty { sourceSummary(concept) }
-                if concept.isWritten {
-                    Button("Rewrite") { model.write(concept) }
-                        .disabled(model.busy != nil)
-                }
+                Spacer()
+                Menu("Lesson options") {
+                    Button("Mark as understood") { model.mark(concept, .known) }.disabled(concept.isKnown)
+                    Button("Still learning") { model.mark(concept, .learning) }
+                    if concept.isWritten {
+                        Divider()
+                        Button("Rewrite entry") { model.write(concept) }.disabled(model.busy != nil)
+                    }
+                }.font(.system(size: 11))
             }
             .padding(.horizontal, 22).padding(.vertical, 12)
+            .background(LibraryTheme.chrome)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -345,9 +479,9 @@ struct ContentView: View {
     /// of the graph is there to be navigated, not read.
     private func unwritten(_ concept: Concept) -> some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text("No entry yet")
+            Text("Ready to explore this concept")
                 .font(.system(size: 13, weight: .medium))
-            Text("Frontier will ask Claude for an explanation at your level — every "
+            Text("Frontier will ask your selected AI for an explanation at your level — every "
                  + "claim followed by the source it came from, questions to check "
                  + "yourself against, and anything it could not source listed "
                  + "separately rather than smoothed over. Then it checks that each "
@@ -360,12 +494,11 @@ struct ContentView: View {
             } label: {
                 Label("Write this entry", systemImage: "text.append")
             }
+            .buttonStyle(LibraryPrimaryButton())
             .disabled(model.busy != nil)
             .help(model.busy == nil ? "Generate the entry, with sources"
                                     : "Busy writing something else")
         }
-        .padding(.horizontal, 22)
-        .padding(.top, 4)
     }
 
     /// Sources are listed inside the rendered entry; this is the one-line
@@ -399,49 +532,129 @@ struct ContentView: View {
     }
 }
 
-/// A resource to learn end to end: a URL or a PDF.
-private struct ImportSheet: View {
+/// Preview extraction before spending AI usage on a document.
+struct ImportSheet: View {
     @ObservedObject var model: Model
     @Environment(\.dismiss) private var dismiss
     @State private var entry = ""
+    @State private var preview: Resource.Loaded?
+    @State private var reading = false
+    @State private var saving = false
+    @State private var error: String?
+
+    init(model: Model, previewResource: Resource.Loaded? = nil) {
+        self.model = model
+        _preview = State(initialValue: previewResource)
+        _entry = State(initialValue: previewResource?.origin ?? "")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Import a course").font(.system(size: 14, weight: .semibold))
-            TextField("URL or PDF path — e.g. https://rlhfbook.com/", text: $entry)
-                .textFieldStyle(.roundedBorder)
-            HStack(spacing: 8) {
-                Button("Choose PDF…") { pick() }
-                if !entry.isEmpty, !entry.hasPrefix("http") {
-                    Text((entry as NSString).lastPathComponent)
-                        .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
-                }
+            Text("Add material").font(.custom("Georgia", size: 26))
+            TextField("Web URL or document path", text: $entry).textFieldStyle(.roundedBorder)
+            HStack {
+                Button("Choose document…") { pick() }
+                Button(reading ? "Reading…" : "Preview import") { inspect() }
+                    .disabled(reading || entry.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            Text("The whole resource becomes concepts, chained in its own reading "
-                 + "order, so the daily session walks you through it front to back. "
-                 + "A book is one model call per chapter — twenty minutes or so for "
-                 + "a whole book, and progress lands as it goes.")
-                .font(.system(size: 9)).foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
+            Text(ResourceFiles.formatDescription + ", and web pages.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let error { Text(error).font(.callout).foregroundStyle(.red) }
+            if let preview {
+                Text(preview.name).font(.headline)
+                Text("\(preview.sections.count) sections · \(Resource.batches(preview.sections).count) AI requests")
+                    .font(.caption).foregroundStyle(.secondary)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(preview.sections.enumerated()), id: \.offset) { _, section in
+                            DisclosureGroup(section.title) {
+                                Text(String(section.text.prefix(2000)))
+                                    .font(.system(size: 11)).textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }.padding(.trailing, 16)
+                }.frame(height: 210)
+                Text("Add to library saves the document for reading. Add & generate also sends these sections to your selected AI to create lessons.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("Preview reads the document without calling AI. Check the extracted text before importing.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
-                Button("Import") {
-                    model.importResource(entry)
-                    dismiss()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(entry.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("Add & generate") { save(generate: true) }
+                    .disabled(preview == nil || reading || saving || model.busy != nil)
+                Button(saving ? "Adding…" : "Add to library") { save(generate: false) }
+                    .buttonStyle(LibraryPrimaryButton()).disabled(preview == nil || reading || saving)
             }
         }
-        .padding(18)
-        .frame(width: 460)
+        .padding(22).frame(width: 540).disabled(saving)
+        .buttonStyle(LibrarySecondaryButton())
+        .background(LibraryTheme.paper).foregroundStyle(LibraryTheme.ink).tint(LibraryTheme.accent)
+        .onChange(of: entry) { _, _ in preview = nil; error = nil }
     }
 
+    private func save(generate: Bool) {
+        guard let preview else { return }
+        saving = true
+        Task {
+            do {
+                let item = try await model.addMaterial(preview)
+                if generate { model.importResource(item.loaded, materialID: item.id) }
+                model.screen = .library
+                dismiss()
+            } catch { self.error = error.localizedDescription; saving = false }
+        }
+    }
+    private func inspect() {
+        let spec = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+        reading = true; error = nil; preview = nil
+        Task {
+            let result = await Task.detached { Result { try Resource.read(spec) } }.value
+            reading = false
+            guard entry.trimmingCharacters(in: .whitespacesAndNewlines) == spec else { return }
+            switch result {
+            case .success(let loaded): preview = loaded
+            case .failure(let failure): error = failure.localizedDescription
+            }
+        }
+    }
     private func pick() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.pdf]
+        panel.allowedContentTypes = ResourceFiles.extensions.compactMap { UTType(filenameExtension: $0) }
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url { entry = url.path }
+    }
+}
+
+/// A measured renderer and native action share one scroll position. The outer
+/// viewport stays bounded even when the introduction is longer than the window.
+private struct IntroductionPage<Action: View>: View {
+    let markdown: String
+    @ViewBuilder var action: () -> Action
+    @State private var contentHeight: CGFloat = 180
+
+    var body: some View {
+        GeometryReader { viewport in
+            ScrollViewReader { position in
+              ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    WebPane(markdown: markdown, contentHeightChanged: { contentHeight = $0 })
+                        .frame(width: viewport.size.width, height: contentHeight)
+                        .id("introduction-top")
+                    VStack(alignment: .leading, spacing: 20) {
+                        LibraryTheme.rule.frame(height: 1)
+                        action()
+                    }
+                    .frame(maxWidth: 740, alignment: .leading)
+                    .padding(.horizontal, 32).padding(.bottom, 32)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                }
+              }.frame(width: viewport.size.width, height: viewport.size.height)
+                .onChange(of: markdown) { _, _ in position.scrollTo("introduction-top", anchor: .top) }
+            }
+        }
     }
 }

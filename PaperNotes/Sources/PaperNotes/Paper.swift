@@ -65,6 +65,8 @@ struct Paper: Identifiable, Equatable {
     /// Thumbs-up. Starred papers count for more when ranking recommendations, so
     /// "more like this" has something concrete to work from.
     var starred: Bool = false
+    /// Explicit links and the reader’s reason, independent of citation inference.
+    var connections: [String: String] = [:]
 
     /// Read, kept, and no longer part of the current picture.
     ///
@@ -310,6 +312,7 @@ extension Paper {
         if !refs.isEmpty { out += "refs: \(refs.joined(separator: ", "))\n" }
         if !pdfPath.isEmpty { out += "pdf: \(pdfPath)\n" }
         if citations > 0 { out += "cited: \(citations)\n" }
+        if !connections.isEmpty, let data = try? JSONEncoder().encode(connections), let json = String(data: data, encoding: .utf8) { out += "connections: \(json)\n" }
         if starred { out += "starred: true\n" }
         if archaic { out += "archaic: true\n" }
         if queuePosition > 0 { out += "queue: \(queuePosition)\n" }
@@ -354,6 +357,7 @@ extension Paper {
         self.pdfPath = front["pdf"] ?? ""
         self.citations = front["cited"].flatMap(Int.init) ?? 0
         self.starred = (front["starred"] ?? "") == "true"
+        self.connections = front["connections"].flatMap { $0.data(using: .utf8) }.flatMap { try? JSONDecoder().decode([String: String].self, from: $0) } ?? [:]
         self.archaic = (front["archaic"] ?? "") == "true"
         self.queuePosition = front["queue"].flatMap(Int.init) ?? -1
         self.body = lines[(close + 1)...].joined(separator: "\n")

@@ -58,10 +58,55 @@ struct ProviderSnapshot {
     var isStale = false
     /// Server-supplied backoff hint, when it supplies a usable one.
     var retryAfter: TimeInterval?
+    /// Memory-only marker: don't carry old values across a changed Claude login.
+    var credentialFingerprint: String?
+    var identityLabel: String?
+    var accountIdentity: String?
+    var subscriptionActiveUntil: Date?
 
     /// The window closest to its ceiling — what the menu bar should surface.
     var headline: Meter? {
         meters.max(by: { $0.percent < $1.percent })
+    }
+}
+
+struct UsagePollingState {
+    var snapshot = ProviderSnapshot()
+    var failures = 0
+    var next = Date.distantPast
+
+    mutating func apply(_ fresh: ProviderSnapshot, now: Date = Date()) {
+        if fresh.error == nil {
+            snapshot = fresh
+            failures = 0
+            next = now.addingTimeInterval(300)
+            return
+        }
+        failures += 1
+        if snapshot.meters.isEmpty || snapshot.credentialFingerprint != fresh.credentialFingerprint {
+            snapshot = fresh
+        } else {
+            snapshot.error = fresh.error
+            snapshot.isStale = true
+        }
+        let backoff = fresh.retryAfter ?? min(60 * pow(2, Double(min(failures, 10))), 1800)
+        next = now.addingTimeInterval(min(max(backoff, 30), 1800))
+    }
+
+    mutating func refreshOnOpen(now: Date = Date()) {
+        if failures == 0, snapshot.fetchedAt.map({ now.timeIntervalSince($0) > 60 }) ?? true {
+            next = .distantPast
+        }
+    }
+}
+
+struct AccountUsage: Identifiable {
+    var account: UsageAccount
+    var state = UsagePollingState()
+    var id: String { account.id }
+    var savedSubscriptionDate: SavedSubscriptionDate? {
+        guard let identity = state.snapshot.accountIdentity else { return nil }
+        return account.subscriptionDates[identity]
     }
 }
 

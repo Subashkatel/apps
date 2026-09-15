@@ -38,69 +38,60 @@ enum ForceLayout {
 
         // Simulation happens in an abstract unit space; the canvas only matters at
         // the end, when the result is scaled into it.
-        var pos: [String: CGPoint] = [:]
+        // Dense indices keep string hashing and dictionary copies out of the
+        // quadratic force loop. Each pair contributes equal/opposite forces.
+        let indices = Dictionary(uniqueKeysWithValues: ids.enumerated().map { ($0.element, $0.offset) })
+        var positions: [CGPoint] = ids.enumerated().map { i, id in
+            let angle = Double(i) / Double(ids.count) * 2 * .pi
+            let radius = 100 * (0.75 + hashUnit(id, salt: 11) * 0.5)
+            return CGPoint(x: cos(angle) * radius, y: sin(angle) * radius)
+        }
         var degree: [String: Int] = [:]
-        let ring = 100.0
-        for (i, id) in ids.enumerated() {
-            let angle = (Double(i) / Double(ids.count)) * 2 * .pi
-            let jitter = 0.75 + hashUnit(id, salt: 11) * 0.5
-            pos[id] = CGPoint(x: cos(angle) * ring * jitter, y: sin(angle) * ring * jitter)
+        var links: [(Int, Int, Double)] = []
+        for (a, b, weight) in edges {
+            guard let i = indices[a], let j = indices[b] else { continue }
+            degree[a, default: 0] += 1; degree[b, default: 0] += 1
+            links.append((i, j, weight))
         }
-        for (a, b, _) in edges {
-            degree[a, default: 0] += 1
-            degree[b, default: 0] += 1
-        }
-
-        let k = 90.0                       // ideal edge length in unit space
+        let k = 90.0
         var temperature = 60.0
-
-        for _ in 0..<iterations {
-            var disp: [String: CGPoint] = [:]
-
-            for a in ids {
-                guard let pa = pos[a] else { continue }
-                var dx = 0.0, dy = 0.0
-                for b in ids where a != b {
-                    guard let pb = pos[b] else { continue }
-                    var vx = Double(pa.x - pb.x), vy = Double(pa.y - pb.y)
-                    var dist = sqrt(vx * vx + vy * vy)
-                    if dist < 0.01 {
-                        vx = hashUnit(a, salt: 3) - 0.5
-                        vy = hashUnit(a, salt: 5) - 0.5
-                        dist = 0.01
+        for _ in 0..<max(0, iterations) {
+            if Task.isCancelled { return [:] }
+            var displacement = positions.map { CGPoint(x: -$0.x * 0.75, y: -$0.y * 0.75) }
+            for i in positions.indices {
+                for j in (i + 1)..<positions.count {
+                    var dx = positions[i].x - positions[j].x
+                    var dy = positions[i].y - positions[j].y
+                    var distanceSquared = dx * dx + dy * dy
+                    if distanceSquared < 0.0001 {
+                        dx = hashUnit(ids[i], salt: 3) - 0.5
+                        dy = hashUnit(ids[j], salt: 5) - 0.5
+                        distanceSquared = max(0.0001, dx * dx + dy * dy)
                     }
-                    let force = (k * k) / dist
-                    dx += (vx / dist) * force
-                    dy += (vy / dist) * force
+                    let force = k * k / distanceSquared
+                    let fx = dx * force, fy = dy * force
+                    displacement[i].x += fx; displacement[i].y += fy
+                    displacement[j].x -= fx; displacement[j].y -= fy
                 }
-                // Gravity, so disconnected papers drift back instead of escaping.
-                // Without it an unconnected node feels only repulsion and leaves.
-                dx -= Double(pa.x) * 0.75
-                dy -= Double(pa.y) * 0.75
-                disp[a] = CGPoint(x: dx, y: dy)
             }
-
-            for (a, b, weight) in edges {
-                guard let pa = pos[a], let pb = pos[b] else { continue }
-                let vx = Double(pa.x - pb.x), vy = Double(pa.y - pb.y)
-                let dist = max(0.01, sqrt(vx * vx + vy * vy))
-                let force = (dist * dist) / k * (0.5 + weight)
-                let fx = (vx / dist) * force, fy = (vy / dist) * force
-                disp[a] = CGPoint(x: (disp[a]?.x ?? 0) - fx, y: (disp[a]?.y ?? 0) - fy)
-                disp[b] = CGPoint(x: (disp[b]?.x ?? 0) + fx, y: (disp[b]?.y ?? 0) + fy)
+            for (i, j, weight) in links {
+                let dx = positions[i].x - positions[j].x, dy = positions[i].y - positions[j].y
+                let distance = max(0.01, hypot(dx, dy))
+                let force = distance / k * (0.5 + weight)
+                let fx = dx * force, fy = dy * force
+                displacement[i].x -= fx; displacement[i].y -= fy
+                displacement[j].x += fx; displacement[j].y += fy
             }
-
-            for id in ids {
-                guard let p = pos[id], let d = disp[id] else { continue }
-                let mag = max(0.0001, sqrt(Double(d.x * d.x + d.y * d.y)))
-                let step = min(mag, temperature)
-                let nx = Double(p.x) + (Double(d.x) / mag) * step
-                let ny = Double(p.y) + (Double(d.y) / mag) * step
-                guard nx.isFinite, ny.isFinite else { continue }
-                pos[id] = CGPoint(x: nx, y: ny)
+            for i in positions.indices {
+                let d = displacement[i]
+                let magnitude = max(0.0001, hypot(d.x, d.y))
+                let factor = min(magnitude, temperature) / magnitude
+                let next = CGPoint(x: positions[i].x + d.x * factor, y: positions[i].y + d.y * factor)
+                if next.x.isFinite && next.y.isFinite { positions[i] = next }
             }
             temperature = max(0.05, temperature * 0.985)
         }
+        let pos = Dictionary(uniqueKeysWithValues: zip(ids, positions))
 
         return fit(pos, degree: degree, into: size)
     }

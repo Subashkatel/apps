@@ -14,20 +14,7 @@ enum TrustedAuthors {
     static var fileURL: URL { Library.root.appendingPathComponent("trusted-authors.txt") }
     static var dismissedURL: URL { Library.root.appendingPathComponent("not-interested.txt") }
 
-    private static let defaults = """
-    # Authors whose new work you want to hear about.
-    #
-    # One full name per line, as it appears on arXiv. Matched against the paper's
-    # complete author list, not just the first few, so it finds papers where they
-    # are the last author too.
-    #
-    # These feed the "What to Read Next" window alongside the papers your library
-    # keeps citing. Nothing here is downloaded automatically.
-
-    Owain Evans
-
-    # Add more below. Lines starting with # are ignored.
-    """
+    private static let defaults = "# Followed authors: add one full name per line.\n"
 
     static func bootstrap() {
         if !FileManager.default.fileExists(atPath: fileURL.path) {

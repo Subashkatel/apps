@@ -1,29 +1,18 @@
 #!/bin/bash
-# Builds VoiceBridge.app, installs the whisper model, and launches it.
+# Builds VoiceBridge.app. Installation, launch and model download are separate steps.
 set -euo pipefail
 cd "$(dirname "$0")"
+INSTALL_DIR="${INSTALL_DIR:-/Applications}"
 
 APP="VoiceBridge"
-BUNDLE="build/$APP.app"
-SUPPORT="$HOME/Library/Application Support/VoiceBridge"
-MODEL="ggml-small.en.bin"
-
-echo "==> Checking prerequisites"
-command -v whisper-cli >/dev/null || { echo "missing whisper-cli — run: brew install whisper-cpp"; exit 1; }
-mkdir -p "$SUPPORT"
-if [ ! -f "$SUPPORT/$MODEL" ]; then
-  if [ -f "models/$MODEL" ]; then
-    echo "    installing model into Application Support"
-    cp "models/$MODEL" "$SUPPORT/$MODEL"
-  else
-    echo "    downloading $MODEL"
-    curl -Lf --progress-bar -o "$SUPPORT/$MODEL" \
-      "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$MODEL"
-  fi
-fi
+BUNDLE="${APP_BUILD_ROOT:-$HOME/Library/Caches/LocalApps/Builds}/$APP.app"
 
 echo "==> Compiling"
-swift build -c release
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$PWD/.build/ModuleCache}"
+export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$CLANG_MODULE_CACHE_PATH}"
+swift_args=(-c release --jobs "${SWIFT_JOBS:-2}" --cache-path "$PWD/.build/spm-cache")
+[ "${SWIFT_DISABLE_SANDBOX:-0}" != "1" ] || swift_args+=(--disable-sandbox)
+swift build "${swift_args[@]}"
 
 echo "==> Rendering icon"
 rm -rf build/AppIcon.iconset
@@ -59,32 +48,61 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# Finder metadata copied into generated bundles prevents macOS code signing.
+xattr -cr "$BUNDLE"
+plutil -lint "$BUNDLE/Contents/Info.plist" >/dev/null
+
 # A fixed certificate gives a designated requirement of
 #   identifier "local.voicebridge" and certificate root = H"..."
 # which survives rebuilds, so the Accessibility grant is not invalidated every
 # time. Ad-hoc signing keys TCC to the binary hash instead, which is why this app
 # kept losing its permission. Run Tools/make-signing-identity.sh to create it.
-IDENTITY="VoiceBridge Local Signing"
-if security find-identity -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
+IDENTITY="${SIGNING_IDENTITY:-}"
+if [ -n "$IDENTITY" ]; then
   echo "==> Signing with '$IDENTITY' (stable — TCC grant survives)"
-  codesign --force --sign "$IDENTITY" --identifier local.voicebridge "$BUNDLE" 2>&1 | grep -v "replacing existing" || true
+  codesign --force --sign "$IDENTITY" --identifier local.voicebridge "$BUNDLE"
 else
   echo "==> Signing (ad-hoc) — WARNING: this invalidates the Accessibility grant."
-  echo "    Run Tools/make-signing-identity.sh to stop that happening."
-  codesign --force --sign - "$BUNDLE" >/dev/null 2>&1
+  echo "    Set SIGNING_IDENTITY to a local signing identity to preserve grants across rebuilds."
+  codesign --force --sign - "$BUNDLE"
 fi
 
-echo "==> Installing to /Applications"
+codesign --verify --deep --strict "$BUNDLE"
+
+if [ "${INSTALL:-0}" != "1" ]; then
+  echo "Built: $BUNDLE"
+  exit 0
+fi
+mkdir -p "$INSTALL_DIR"
+echo "==> Installing to $INSTALL_DIR"
 pkill -x "$APP" 2>/dev/null || true
 sleep 1
-rm -rf "/Applications/$APP.app"
-cp -R "$BUNDLE" "/Applications/$APP.app"
+STAGED=$(mktemp -d "$INSTALL_DIR/.local-app-install.XXXXXX")
+cleanup_install() {
+  if [ -e "$STAGED/previous.app" ] && [ ! -e "$INSTALL_DIR/$APP.app" ]; then
+    if ! mv "$STAGED/previous.app" "$INSTALL_DIR/$APP.app"; then
+      echo "Previous app preserved at $STAGED/previous.app; restore it manually." >&2
+      return
+    fi
+  fi
+  rm -rf "$STAGED"
+}
+trap cleanup_install EXIT
+cp -R "$BUNDLE" "$STAGED/$APP.app"
+xattr -cr "$STAGED/$APP.app"
+codesign --verify --deep --strict "$STAGED/$APP.app"
+if [ -e "$INSTALL_DIR/$APP.app" ]; then
+  mv "$INSTALL_DIR/$APP.app" "$STAGED/previous.app"
+fi
+if ! mv "$STAGED/$APP.app" "$INSTALL_DIR/$APP.app"; then
+  exit 1
+fi
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-  -f "/Applications/$APP.app" 2>/dev/null || true
+  -f "$INSTALL_DIR/$APP.app" 2>/dev/null || true
 
-if [ "${NO_LAUNCH:-0}" != "1" ]; then
+if [ "${NO_LAUNCH:-1}" != "1" ]; then
   echo "==> Launching"
-  open "/Applications/$APP.app"
+  open "$INSTALL_DIR/$APP.app"
 fi
 cat <<'NOTE'
 Done. Double-tap Control to dictate.

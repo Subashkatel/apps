@@ -131,7 +131,7 @@ enum Snapshot {
     static let sampleCandidates: [Recommender.Candidate] = [
         // One from each source, so the snapshot shows both row shapes.
         .init(arxivID: "2604.25891", weight: 22, citedByYours: [],
-              source: .author("Owain Evans"),
+              source: .author("Example Author"),
               title: "Conditional misalignment: common interventions can hide emergent misalignment",
               authors: ["Jan Dubiński", "Jan Betley", "Anna Sztyber-Betley", "Daniel Tan"],
               year: 2026, citations: 0, verdict: "ESSENTIAL",

@@ -1,26 +1,15 @@
+import LocalSupport
 import Foundation
 
 /// Runs the `claude` CLI as a judge. The app has no model inside it, but the CLI is
 /// on this machine and already authenticated, so it can be shelled out to the same
 /// way `git` is.
 enum Judge {
-    static var cliPath: String? {
-        let candidates = [
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".local/bin/claude").path,
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude"
-        ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }
-
-    static var isAvailable: Bool { cliPath != nil }
-
-    /// Sends `prompt` on stdin and returns the reply. Synchronous on purpose — both
-    /// callers are already off the main thread, and streaming buys nothing here.
+    static var cliPath: String? { (try? PaperAI.load())?.executable?.path }
+    static var isAvailable: Bool { (try? PaperAI.load().validated()) != nil }
     static func ask(_ prompt: String, timeout: TimeInterval = 240) -> String? {
-        guard let cli = cliPath else { return nil }
-        return run(executable: cli, arguments: ["-p"], stdin: prompt, timeout: timeout)
+        do { return try AIClient.ask(prompt, settings: PaperAI.load(), timeout: timeout) }
+        catch { return nil }
     }
 
     /// The subprocess plumbing, separated from "which CLI" so the self-test can
@@ -79,7 +68,7 @@ enum Judge {
         // The wider excerpt is only paid for when there is something to answer.
         let excerpt = questions.isEmpty
             ? excerpt(of: paper.resolvedPDF?.path ?? paper.pdfPath)
-            : excerpt(of: paper.pdfPath, pages: 25, limit: 90_000)
+            : excerpt(of: paper.resolvedPDF?.path ?? paper.pdfPath, pages: 25, limit: 90_000)
         guard !excerpt.isEmpty else { return "No PDF text available for this paper." }
 
         var asked = ""
@@ -141,7 +130,7 @@ enum Judge {
     /// something. The rubric below is written to fight that, because the default
     /// behaviour of any model asked to "grade a paper" is to grade the execution.
     static func appraise(_ paper: Paper) -> (verdict: Verdict, note: String, score: Int)? {
-        let excerpt = excerpt(of: paper.pdfPath, pages: 8)
+        let excerpt = excerpt(of: paper.resolvedPDF?.path ?? paper.pdfPath, pages: 8)
         guard !excerpt.isEmpty else { return nil }
         guard let reply = ask("""
         Grade this paper for a researcher who reads to find ideas — surprising

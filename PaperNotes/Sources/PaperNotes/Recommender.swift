@@ -267,7 +267,7 @@ enum Recommender {
         // a verdict written about them in the third person reads like a report card
         // someone else filed.
         return """
-        You are advising an ML PhD student — the reader — on whether to read a
+        You are advising the reader, based on their library, on whether to read a
         specific paper. Address them as "you".
 
         Your library already contains these papers:

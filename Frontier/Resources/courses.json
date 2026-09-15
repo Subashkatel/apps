@@ -1,0 +1,26 @@
+[
+  {
+    "name": "MIT 6.5940 \u2014 TinyML and Efficient Deep Learning Computing",
+    "url": "https://hanlab.mit.edu/courses/2024-fall-65940"
+  },
+  {
+    "name": "Stanford CS149 \u2014 Parallel Computing",
+    "url": "https://gfxcourses.stanford.edu/cs149/fall24"
+  },
+  {
+    "name": "CMU 15-418/618 \u2014 Parallel Computer Architecture and Programming",
+    "url": "https://www.cs.cmu.edu/~418/schedule.html"
+  },
+  {
+    "name": "CMU 10-414/714 \u2014 Deep Learning Systems",
+    "url": "https://dlsyscourse.org/lectures/"
+  },
+  {
+    "name": "Stanford CS336 \u2014 Language Modeling from Scratch",
+    "url": "https://stanford-cs336.github.io/spring2025/"
+  },
+  {
+    "name": "CMU 15-442/642 \u2014 Machine Learning Systems",
+    "url": "https://mlsyscourse.org/"
+  }
+]

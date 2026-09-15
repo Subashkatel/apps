@@ -9,6 +9,50 @@ enum CLI {
         // Line-buffered: these commands take minutes, and a redirected log that
         // stays empty until the process exits is indistinguishable from a hang.
         setvbuf(stdout, nil, _IOLBF, 0)
+        if let i = args.firstIndex(of: "--test-ai"), i + 1 < args.count, let provider = AIProvider(rawValue: args[i + 1]) {
+            do {
+                var settings = try AISettings.load()
+                settings.provider = provider
+                _ = try AIClient.ask("Reply with only: Connection OK", settings: settings, timeout: 90)
+                print("\(provider.title) connection succeeded.")
+                exit(0)
+            } catch { print(error.localizedDescription); exit(1) }
+        }
+        if let i = args.firstIndex(of: "--check-resource"), i + 1 < args.count {
+            do { let resource = try Resource.read(args[i + 1]); print("Loaded \(resource.name): \(resource.sections.count) sections, \(resource.original?.data.count ?? 0) original bytes"); exit(0) }
+            catch { print(error.localizedDescription); exit(1) }
+        }
+        if args.contains("--list-library") {
+            let model = Model(); model.load()
+            for item in model.materials { print("\(item.id)\t\(item.title)\toriginal=\(item.originalFile != nil)") }
+            exit(0)
+        }
+        if let i = args.firstIndex(of: "--attach-original"), i + 2 < args.count {
+            do {
+                let model = Model(); model.load()
+                guard let item = model.materials.first(where: { $0.id == args[i + 1] }) else { throw FrontierError("Material not found.") }
+                let file = URL(fileURLWithPath: args[i + 2])
+                let loaded = try Resource.read(file.path)
+                var updated = item
+                if updated.sections.isEmpty { updated.sections = loaded.sections }
+                updated = try MaterialStore.live.attach(.init(filename: file.lastPathComponent, data: Data(contentsOf: file)), to: updated)
+                try model.saveMaterial(updated)
+                print("Attached original to \(updated.title); \(model.lessons(for: updated).count) existing lessons preserved.")
+                exit(0)
+            } catch { print(error.localizedDescription); exit(1) }
+        }
+        if let i = args.firstIndex(of: "--add-library"), i + 1 < args.count {
+            Task { @MainActor in
+                do {
+                    let loaded = try await Task.detached { try Resource.read(args[i + 1]) }.value
+                    let model = Model(); model.load()
+                    let material = try await model.addMaterial(loaded)
+                    print("Added to library: \(material.title) [\(material.id)]")
+                    exit(0)
+                } catch { print(error.localizedDescription); exit(1) }
+            }
+            NSApplication.shared.run(); exit(1)
+        }
         Store.shared.bootstrap()
         if let i = args.firstIndex(of: "--seed"), i + 1 < args.count { seed(args[i + 1]) }
         if args.contains("--grow") {
@@ -48,7 +92,7 @@ enum CLI {
         }
         print("read \(seeds.count) seed terms from \(path)")
         for s in seeds.prefix(30) { print("   · \(s)") }
-        guard Tutor.isAvailable else { print("\nclaude CLI not found"); exit(1) }
+        guard Tutor.isAvailable else { print(Tutor.configurationError ?? "Configure AI in Frontier settings"); exit(1) }
         print("\nasking for a first pass of the graph…")
         let proposed = Tutor.expand(seeds: seeds, existing: Store.shared.concepts, count: 18)
         let added = Store.shared.add(proposed)
@@ -58,7 +102,7 @@ enum CLI {
     }
 
     static func grow(_ count: Int) -> Never {
-        guard Tutor.isAvailable else { print("claude CLI not found"); exit(1) }
+        guard Tutor.isAvailable else { print(Tutor.configurationError ?? "Configure AI in Frontier settings"); exit(1) }
         let existing = Store.shared.concepts
         // The graph's own holes are the best prompt for what to add next.
         print("reading the syllabi…")
@@ -77,7 +121,7 @@ enum CLI {
 
     static func write(_ id: String) -> Never {
         guard var c = Store.shared.concept(id) else { print("no concept: \(id)"); exit(1) }
-        guard Tutor.isAvailable else { print("claude CLI not found"); exit(1) }
+        guard Tutor.isAvailable else { print(Tutor.configurationError ?? "Configure AI in Frontier settings"); exit(1) }
         print("writing \(c.title)…")
         guard let written = Tutor.write(c, context: Store.shared.concepts) else {
             print("the model did not answer — \(Tutor.lastError ?? "no detail")"); exit(1)
@@ -105,10 +149,10 @@ enum CLI {
     /// long post — and turns *all of it* into chained concepts, so the daily
     /// session walks through it front to back.
     static func importResource(_ spec: String, name: String?, planOnly: Bool = false) -> Never {
-        if !planOnly { guard Tutor.isAvailable else { print("claude CLI not found"); exit(1) } }
+        if !planOnly { guard Tutor.isAvailable else { print(Tutor.configurationError ?? "Configure AI in Frontier settings"); exit(1) } }
         print("loading \(spec)…")
         guard let loaded = Resource.load(spec, nameOverride: name) else {
-            print("could not read \(spec) — give a PDF path or an http(s) URL"); exit(1)
+            print("could not read \(spec) — use \(ResourceFiles.formatDescription) or an http(s) URL"); exit(1)
         }
         let batches = Resource.batches(loaded.sections)
         let chars = loaded.sections.reduce(0) { $0 + $1.text.count }
@@ -145,7 +189,7 @@ enum CLI {
 
     static func walk(_ id: String) -> Never {
         guard var c = Store.shared.concept(id) else { print("no concept: \(id)"); exit(1) }
-        guard Tutor.isAvailable else { print("claude CLI not found"); exit(1) }
+        guard Tutor.isAvailable else { print(Tutor.configurationError ?? "Configure AI in Frontier settings"); exit(1) }
         print("walking through \(c.title)…")
         guard let text = Tutor.walkthrough(c, context: Store.shared.concepts) else {
             print("no answer — \(Tutor.lastError ?? "no detail")"); exit(1)
@@ -174,7 +218,7 @@ enum CLI {
 
     /// Rebuilds the curriculum from what real courses teach.
     static func syllabus() -> Never {
-        guard Tutor.isAvailable else { print("claude CLI not found"); exit(1) }
+        guard Tutor.isAvailable else { print(Tutor.configurationError ?? "Configure AI in Frontier settings"); exit(1) }
         print("reading \(Courses.all.count) syllabi…")
         var fetched: [(name: String, topics: [String])] = []
         for course in Courses.all {
@@ -192,7 +236,7 @@ enum CLI {
     }
 
     static func latexify() -> Never {
-        guard Tutor.isAvailable else { print("claude CLI not found"); exit(1) }
+        guard Tutor.isAvailable else { print(Tutor.configurationError ?? "Configure AI in Frontier settings"); exit(1) }
         let all = Store.shared.concepts
         print("rewriting mathematics as LaTeX in \(all.count) concepts…")
         let rewritten = Tutor.latexify(all)

@@ -1,3 +1,4 @@
+import LocalSupport
 import Foundation
 
 /// The curriculum on disk.
@@ -9,8 +10,7 @@ import Foundation
 final class Store {
     static let shared = Store()
 
-    static let root = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Frontier")
+    static let root = LocalConfig.dataDirectory("Frontier")
     static var conceptsDir: URL { root.appendingPathComponent("concepts") }
 
     private(set) var concepts: [Concept] = []
@@ -25,9 +25,11 @@ final class Store {
     func reload() {
         let files = (try? FileManager.default.contentsOfDirectory(
             at: Self.conceptsDir, includingPropertiesForKeys: nil)) ?? []
+        let removed = Set(((try? RemovedMaterial.load()) ?? []).flatMap(\.lessonIDs))
         concepts = files
             .filter { $0.pathExtension == "md" }
             .compactMap { (try? String(contentsOf: $0, encoding: .utf8)).flatMap(Concept.init(markdown:)) }
+            .filter { !removed.contains($0.id) }
             .sorted { $0.id < $1.id }
     }
 

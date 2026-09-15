@@ -1,40 +1,68 @@
+import LocalSupport
 import Foundation
+import CryptoKit
 
 /// Reads ~/.codex/auth.json — the credential the Codex CLI maintains — and calls the
 /// endpoint that backs the usage view.
 enum CodexClient {
     static let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
-    static let authPath = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".codex/auth.json")
+    static var authPath: URL {
+        if let path = LocalConfig.path("codexAuthFile", environment: "CODEX_AUTH_FILE") { return path }
+        let home = ProcessInfo.processInfo.environment["CODEX_HOME"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        return home.appendingPathComponent("auth.json")
+    }
 
-    static func credentials() throws -> (token: String, accountID: String) {
-        guard let data = try? Data(contentsOf: authPath) else {
-            throw UsageError.message("No ~/.codex/auth.json — run `codex login`.")
-        }
+    static func credentials(from data: Data) throws -> (token: String, accountID: String, email: String?, subscriptionEnd: Date?) {
         guard
             let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let tokens = root["tokens"] as? [String: Any],
-            let token = tokens["access_token"] as? String
+            let token = tokens["access_token"] as? String, !token.isEmpty
         else {
             throw UsageError.message("Unexpected credential format.")
         }
-        return (token, tokens["account_id"] as? String ?? "")
+        // Decode display metadata only. The server verifies the actual access token.
+        var email: String?
+        var subscriptionEnd: Date?
+        if let jwt = tokens["id_token"] as? String {
+            let parts = jwt.split(separator: ".")
+            if parts.count == 3 {
+                var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+                payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
+                if let decoded = Data(base64Encoded: payload),
+                   let claims = try? JSONSerialization.jsonObject(with: decoded) as? [String: Any] {
+                    email = claims["email"] as? String
+                    let auth = claims["https://api.openai.com/auth"] as? [String: Any]
+                    subscriptionEnd = SubscriptionMetadata.activeUntil(auth?["chatgpt_subscription_active_until"])
+                }
+            }
+        }
+        return (token, tokens["account_id"] as? String ?? "", email, subscriptionEnd)
     }
 
-    static func fetch() async -> ProviderSnapshot {
+    static func fetch(account: UsageAccount = .currentCodex) async -> ProviderSnapshot {
         var snap = ProviderSnapshot()
         do {
-            let (token, account) = try credentials()
+            let path = account.configDirectory == nil ? authPath : account.directory.appendingPathComponent("auth.json")
+            guard let credentialData = try? Data(contentsOf: path) else {
+                throw UsageError.message("No local Codex login found. Use Sign in for this account.")
+            }
+            let (token, accountID, email, subscriptionEnd) = try credentials(from: credentialData)
+            snap.identityLabel = email
+            snap.accountIdentity = SubscriptionMetadata.identity(provider: .codex, account: accountID.isEmpty ? email : accountID)
+            snap.subscriptionActiveUntil = subscriptionEnd
+            snap.credentialFingerprint = SHA256.hash(data: Data((token + "\0" + accountID).utf8))
+                .map { String(format: "%02x", $0) }.joined()
             var req = URLRequest(url: usageURL)
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            if !account.isEmpty { req.setValue(account, forHTTPHeaderField: "chatgpt-account-id") }
+            if !accountID.isEmpty { req.setValue(accountID, forHTTPHeaderField: "chatgpt-account-id") }
             req.timeoutInterval = 15
 
             let (data, resp) = try await URLSession.shared.data(for: req)
             let http = resp as? HTTPURLResponse
             let code = http?.statusCode ?? 0
             if code == 401 || code == 403 {
-                throw UsageError.message("Token expired — run `codex` once to refresh it.")
+                throw UsageError.message("Login needs attention. Open Codex for this account, or use Sign in.")
             }
             if code == 429 {
                 snap.retryAfter = HTTPHint.retryAfter(http)

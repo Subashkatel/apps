@@ -1,3 +1,4 @@
+import LocalSupport
 import Foundation
 
 /// Syllabi from courses that already solved this problem.
@@ -13,25 +14,17 @@ import Foundation
 /// courses are, and so the source of every claim about "what a course covers" is
 /// a page you can open.
 enum Courses {
-    struct Course {
+    struct Course: Decodable {
         var name: String
         var url: String
     }
 
-    static let all: [Course] = [
-        .init(name: "MIT 6.5940 — TinyML and Efficient Deep Learning Computing",
-              url: "https://hanlab.mit.edu/courses/2024-fall-65940"),
-        .init(name: "Stanford CS149 — Parallel Computing",
-              url: "https://gfxcourses.stanford.edu/cs149/fall24"),
-        .init(name: "CMU 15-418/618 — Parallel Computer Architecture and Programming",
-              url: "https://www.cs.cmu.edu/~418/schedule.html"),
-        .init(name: "CMU 10-414/714 — Deep Learning Systems",
-              url: "https://dlsyscourse.org/lectures/"),
-        .init(name: "Stanford CS336 — Language Modeling from Scratch",
-              url: "https://stanford-cs336.github.io/spring2025/"),
-        .init(name: "CMU 15-442/642 — Machine Learning Systems",
-              url: "https://mlsyscourse.org/"),
-    ]
+    static var all: [Course] {
+        let url = LocalConfig.path("frontierCoursesFile", environment: "FRONTIER_COURSES_FILE")
+            ?? Bundle.main.url(forResource: "courses", withExtension: "json")
+        guard let url, let data = try? Data(contentsOf: url) else { return [] }
+        return (try? JSONDecoder().decode([Course].self, from: data)) ?? []
+    }
 
     /// The readable text of a syllabus page, trimmed to the lines that look like
     /// topics. Crude on purpose: the model reads this, and a lecture list

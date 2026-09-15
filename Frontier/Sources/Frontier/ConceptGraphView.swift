@@ -10,6 +10,8 @@ import SwiftUI
 /// behind something.
 struct ConceptGraphView: View {
     @ObservedObject var model: Model
+    var isActive = true
+    var previewHoveredID: String? = nil
     @Environment(\.colorScheme) private var scheme
 
     @State private var sim = GraphSim()
@@ -21,7 +23,19 @@ struct ConceptGraphView: View {
     @State private var ticker: Timer?
     @State private var gesture = ViewportGesture()
     @State private var scrollMonitor: Any?
-    @State private var loadedFor = 0
+    private struct Topology: Equatable {
+        var ids: [String]
+        var prerequisites: [[String]]
+    }
+    @State private var loadedTopology: Topology?
+    @State private var layoutTask: Task<Void, Never>?
+    @State private var layoutRequest = UUID()
+    @State private var arranging = false
+    @State private var visible = false
+    @State private var viewportFrame: CGRect = .zero
+    @State private var byID: [String: Concept] = [:]
+    @State private var labels: [String: String] = [:]
+    @State private var edges: [(String, String, Double)] = []
 
     /// Derived graph data, cached across frames.
     ///
@@ -38,6 +52,10 @@ struct ConceptGraphView: View {
     @State private var dependantsMap: [String: [String]] = [:]
 
     private func refreshDerived() {
+        byID = Dictionary(uniqueKeysWithValues: model.concepts.map { ($0.id, $0) })
+        labels = Dictionary(uniqueKeysWithValues: model.concepts.map { ($0.id, $0.shortTitle) })
+        let present = Set(byID.keys)
+        edges = model.concepts.flatMap { c in c.requires.filter(present.contains).map { (c.id, $0, 1.0) } }
         unlockCounts = Frontier.unlocks(model.concepts)
         readyIDs = Set(Frontier.ready(model.concepts).map(\.id))
         let ranked = model.concepts.sorted {
@@ -58,14 +76,7 @@ struct ConceptGraphView: View {
     /// the long tail becomes specks — and fills back in as you zoom.
     private var detailBudget: Int { max(30, Int(80 * scale * scale)) }
 
-    private var surface: Color { Color(nsColor: scheme == .dark ? .init(srgbRed: 0.09, green: 0.09, blue: 0.11, alpha: 1) : .init(srgbRed: 0.98, green: 0.98, blue: 0.97, alpha: 1)) }
-
-    private var edges: [(String, String, Double)] {
-        let present = Set(model.concepts.map(\.id))
-        return model.concepts.flatMap { c in
-            c.requires.filter(present.contains).map { (c.id, $0, 1.0) }
-        }
-    }
+    private var surface: Color { LibraryTheme.paper }
 
     var body: some View {
         GeometryReader { geo in
@@ -74,8 +85,8 @@ struct ConceptGraphView: View {
                     .contentShape(Rectangle())
                     .onContinuousHover { phase in
                         switch phase {
-                        case .active(let p): hovered = node(at: world(p, in: canvas))
-                        case .ended: hovered = nil
+                        case .active(let p): hovered = node(at: world(p, in: canvas)); model.graphFocus = hovered
+                        case .ended: hovered = nil; model.graphFocus = nil
                         }
                     }
                     .gesture(dragGesture)
@@ -83,21 +94,40 @@ struct ConceptGraphView: View {
                         .onChanged { v in scale = min(4, max(0.25, magnifyBase * v.magnification)) }
                         .onEnded { _ in magnifyBase = scale })
 
+                if arranging {
+                    HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Arranging the graph…").font(.caption) }
+                        .padding(12).background(LibraryTheme.chrome, in: .rect(cornerRadius: 6))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
                 legend
                 controls
-                if let hovered, let c = model.concepts.first(where: { $0.id == hovered }) {
-                    card(c).padding(.top, 58).padding(.leading, 12)
-                }
+                // Keep one warm renderer as the pointer moves between nodes.
+                GraphHoverCard(concept: hovered.flatMap { byID[$0] })
+                    .padding(.top, 48).padding(.leading, 12)
+                    .opacity(hovered == nil ? 0 : 1)
+                    .allowsHitTesting(false).accessibilityHidden(hovered == nil)
                 if model.concepts.isEmpty {
                     Text("Nothing in the graph yet.")
                         .font(.system(size: 11)).foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            .onAppear { refreshDerived(); canvas = geo.size; reload(geo.size); startTicking(); installScrollZoom() }
-            .onDisappear { ticker?.invalidate(); ticker = nil; removeScrollZoom() }
-            .onChange(of: geo.size) { _, new in canvas = new; reload(new) }
-            .onChange(of: model.concepts.count) { _, _ in refreshDerived(); reload(geo.size, force: true) }
+            .onAppear {
+                visible = isActive
+                hovered = previewHoveredID; model.graphFocus = previewHoveredID
+                refreshDerived(); canvas = geo.size; viewportFrame = geo.frame(in: .global)
+                reload(geo.size)
+                if isActive { startTicking(); installScrollZoom() }
+            }
+            .onDisappear { visible = false; ticker?.invalidate(); ticker = nil; removeScrollZoom(); layoutTask?.cancel() }
+            .onChange(of: isActive) { _, active in
+                visible = active
+                if active { hovered = nil; model.graphFocus = nil; startTicking(); installScrollZoom() }
+                else { ticker?.invalidate(); ticker = nil; removeScrollZoom(); hovered = nil }
+            }
+            .onChange(of: geo.size) { _, new in canvas = new; viewportFrame = geo.frame(in: .global); reload(new) }
+            .onChange(of: model.graphFocus) { _, id in hovered = id }
+            .onChange(of: model.concepts) { _, _ in refreshDerived(); reload(geo.size) }
         }
         .background(surface)
     }
@@ -106,24 +136,43 @@ struct ConceptGraphView: View {
 
     private func reload(_ size: CGSize, force: Bool = false) {
         guard size.width > 0 else { return }
-        if !force, loadedFor == model.concepts.count, !sim.bodies.isEmpty { return }
-        loadedFor = model.concepts.count
+        let topology = Topology(ids: model.concepts.map(\.id), prerequisites: model.concepts.map(\.requires))
         var masses: [String: Double] = [:]
-        // Heavier where more rests on it, so bottlenecks settle near the middle
-        // and the graph reads outward from its foundations.
         for c in model.concepts { masses[c.id] = 1 + Double(unlockCounts[c.id] ?? 0) }
-        sim.load(ids: model.concepts.map(\.id), edges: edges, masses: masses, size: size)
+        if !force, loadedTopology == topology {
+            sim.updateMasses(masses)
+            return
+        }
+        loadedTopology = topology
+        let ids = model.concepts.map(\.id), links = edges, weights = masses
+        layoutTask?.cancel()
+        let request = UUID(); layoutRequest = request; arranging = true
+        layoutTask = Task { @MainActor in
+            let started = Date()
+            let worker = Task.detached(priority: .userInitiated) {
+                ForceLayout.layout(ids: ids, edges: links, size: size)
+            }
+            let positions = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: { worker.cancel() }
+            guard !Task.isCancelled, layoutRequest == request else { return }
+            sim.load(ids: ids, edges: links, masses: weights, size: size, seeded: positions, settled: true, preservePositions: false)
+            if previewHoveredID != nil { print("Graph arranged and settled: \(Int(Date().timeIntervalSince(started) * 1000)) ms") }
+            arranging = false
+            if visible { startTicking() }
+        }
     }
 
     private func startTicking() {
-        ticker?.invalidate()
-        ticker = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { _ in
+        guard visible, ticker == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { timer in
             MainActor.assumeIsolated {
-                if !sim.isSettled {
-                    sim.step(centre: CGPoint(x: canvas.width / 2, y: canvas.height / 2))
-                }
+                guard visible, !sim.isSettled else { timer.invalidate(); ticker = nil; return }
+                sim.step(centre: CGPoint(x: canvas.width / 2, y: canvas.height / 2))
             }
         }
+        ticker = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     /// Screen point → graph coordinates. Centre-anchored, so zooming magnifies
@@ -151,17 +200,21 @@ struct ConceptGraphView: View {
                 gesture.began(hit: node(at: world(value.startLocation, in: canvas)),
                               currentPan: pan)
                 if let id = gesture.draggedNode {
-                    if sim.dragging != id { sim.dragging = id; model.selected = id }
-                    sim.dragTarget = world(value.location, in: canvas)
-                    sim.reheat()
+                    if model.selected != id || model.readingMaterialID != nil { model.selectGraphConcept(id) }
+                    if hypot(value.translation.width, value.translation.height) > 2 {
+                        sim.dragging = id
+                        sim.dragTarget = world(value.location, in: canvas)
+                        sim.reheat(); startTicking()
+                    }
                 } else if gesture.isPanning {
                     pan = gesture.pan(for: value.translation)
                 }
             }
             .onEnded { _ in
+                let movedNode = sim.dragging != nil
                 gesture.ended()
                 sim.dragging = nil
-                sim.reheat(0.35)
+                if movedNode { sim.reheat(0.35); startTicking() }
             }
     }
 
@@ -170,10 +223,13 @@ struct ConceptGraphView: View {
     private func installScrollZoom() {
         removeScrollZoom()
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-            let factor = 1 + event.scrollingDeltaY * 0.006
+            guard isActive, let window = event.window, window.attachedSheet == nil,
+                  let content = window.contentView,
+                  viewportFrame.contains(CGPoint(x: event.locationInWindow.x, y: content.bounds.height - event.locationInWindow.y)) else { return event }
+            let factor = exp(event.scrollingDeltaY * 0.006)
             scale = min(4, max(0.25, scale * factor))
             magnifyBase = scale
-            return event
+            return nil
         }
     }
 
@@ -183,13 +239,16 @@ struct ConceptGraphView: View {
     }
 
     private func node(at p: CGPoint) -> String? {
-        sim.bodies.first { _, body in hypot(body.position.x - p.x, body.position.y - p.y) < 16 }?.key
+        sim.bodies.min { a, b in
+            hypot(a.value.position.x - p.x, a.value.position.y - p.y) < hypot(b.value.position.x - p.x, b.value.position.y - p.y)
+        }.flatMap { id, body in
+            hypot(body.position.x - p.x, body.position.y - p.y) < 16 / max(1, scale) ? id : nil
+        }
     }
 
     // MARK: - Drawing
 
     private func draw(in context: GraphicsContext, size: CGSize) {
-        let byID = Dictionary(uniqueKeysWithValues: model.concepts.map { ($0.id, $0) })
         let ready = readyIDs
 
         // Once per frame, not per node — the per-node version of this is the
@@ -208,7 +267,7 @@ struct ConceptGraphView: View {
         for id in sim.bodies.keys {
             guard let c = byID[id] else { continue }
             if c.status != .unread || ready.contains(id)
-                || id == hovered || neighbours.contains(id) || id == model.selected
+                || id == hovered || neighbours.contains(id) || id == model.graphFocus
                 || (importanceRank[id] ?? .max) < budget {
                 detailed.insert(id)
             }
@@ -251,7 +310,7 @@ struct ConceptGraphView: View {
             case .unread:
                 if ready.contains(id) {
                     // Ringed, not filled: available, not yet taken.
-                    context.stroke(Path(ellipseIn: box), with: .color(.accentColor), lineWidth: 2)
+                    context.stroke(Path(ellipseIn: box), with: .color(LibraryTheme.accent), lineWidth: 2)
                 } else {
                     context.fill(Path(ellipseIn: box), with: .color(.secondary.opacity(0.25)))
                 }
@@ -264,7 +323,7 @@ struct ConceptGraphView: View {
             let named = id == hovered || neighbours.contains(id)
                 || ready.contains(id) || c.isKnown || scale > 1.6
             if named {
-                context.draw(Text(c.shortTitle)
+                context.draw(Text(labels[id] ?? c.title)
                     .font(.system(size: 9, weight: id == hovered ? .semibold : .regular))
                     .foregroundStyle(id == hovered ? AnyShapeStyle(.primary)
                                                    : AnyShapeStyle(.secondary)),
@@ -293,7 +352,7 @@ struct ConceptGraphView: View {
                 } label: { Image(systemName: "arrow.counterclockwise") }
                     .help("Reset the view and re-settle the graph")
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(LibrarySecondaryButton())
             .controlSize(.small)
         }
         .padding(12)
@@ -306,7 +365,7 @@ struct ConceptGraphView: View {
 
     private var legend: some View {
         HStack(spacing: 12) {
-            ForEach([("Known", Color.green), ("Learning", .orange), ("Ready", .accentColor),
+            ForEach([("Known", Color.green), ("Learning", .orange), ("Ready", LibraryTheme.accent),
                      ("Behind a prerequisite", .secondary.opacity(0.4))], id: \.0) { name, colour in
                 HStack(spacing: 4) {
                     Circle().fill(colour).frame(width: 6, height: 6)
@@ -327,15 +386,18 @@ struct ConceptGraphView: View {
         .padding(12)
     }
 
-    private func card(_ c: Concept) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(c.plainTitle).font(.system(size: 12, weight: .medium))
-            if !c.relevance.isEmpty {
-                Text(c.plainRelevance).font(.system(size: 10)).foregroundStyle(.secondary)
-                    .frame(maxWidth: 320, alignment: .leading)
-            }
-        }
-        .padding(8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+}
+
+/// The same bundled Markdown/KaTeX engine as Read, sized for a graph preview.
+struct GraphHoverCard: View {
+    let concept: Concept?
+    @State private var height: CGFloat = 120
+    var body: some View {
+        let markdown = concept.map { "# " + $0.title + "\n\n" + $0.relevance } ?? " "
+        WebPane(markdown: markdown, contentHeightChanged: { height = $0 }, presentation: .card)
+            .frame(width: 350, height: min(360, max(60, height)))
+            .clipShape(.rect(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(LibraryTheme.rule, lineWidth: 1))
+            .shadow(color: .black.opacity(0.16), radius: 8, y: 3)
     }
 }

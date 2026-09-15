@@ -13,7 +13,6 @@ enum AppAssets {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if ProcessInfo.processInfo.environment["POMO_SELFTEST"] == "1" { Self.selfTest() }
         MainActor.assumeIsolated {
             let timer = TimerManager.shared
             let overlay = OverlayController.shared
@@ -192,6 +191,12 @@ enum DayReportWindow {
 
 @main
 struct PomodoroApp: App {
+    init() {
+        if CommandLine.arguments.contains("--selftest") || ProcessInfo.processInfo.environment["POMO_SELFTEST"] == "1" {
+            AppDelegate.selfTest()
+        }
+    }
+
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var timer = TimerManager.shared
 

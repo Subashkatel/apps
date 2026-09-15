@@ -1,4 +1,5 @@
 import SwiftUI
+import LocalSupport
 import Observation
 
 enum Prefs {
@@ -30,6 +31,8 @@ enum Prefs {
 @MainActor
 @Observable
 final class AppModel {
+    var showingDiscussion = false
+    var conversations: [String: AIConversation] = [:]
     static let shared = AppModel()
 
     var papers: [Paper] = []
@@ -37,6 +40,7 @@ final class AppModel {
     var draft: Paper?
     var related: [Relation] = []
     var status = ""
+    var saveError: String?
     var isBusy = false
     var showingAdd = false
     var unpushed = 0
@@ -59,9 +63,29 @@ final class AppModel {
 
     private var pushTimer: Timer?
 
+    private var baseline: Paper?
+    private var hasBootstrapped = false
     private init() {}
 
+    @discardableResult func flushDraft() -> Bool {
+        guard let draft, draft != baseline else { return true }
+        var merged = draft
+        if let baseline, baseline.id == draft.id, var current = Library.shared.paper(withID: draft.id) {
+            if draft.body != baseline.body { current.body = draft.body }
+            if draft.verdict != baseline.verdict { current.verdict = draft.verdict }
+            if draft.connections != baseline.connections { current.connections = draft.connections }
+            merged = current
+        }
+        guard Library.shared.save(merged) != nil else { return false }
+        self.draft = merged; baseline = merged
+        return true
+    }
+
     func bootstrap() {
+        guard !hasBootstrapped else { return }; hasBootstrapped = true
+        Library.shared.onSaveError = { [weak self] message in
+            self?.saveError = message
+        }
         Library.shared.bootstrap()
         refresh()
         // Push on a timer rather than per note: a commit is instant and never fails,
@@ -74,8 +98,9 @@ final class AppModel {
     }
 
     func delete(_ paper: Paper) {
+        guard flushDraft() else { return }
         Library.shared.delete(paper)
-        if selectedID == paper.arxivID { selectedID = nil; draft = nil; related = [] }
+        if selectedID == paper.arxivID { selectedID = nil; draft = nil; baseline = nil; related = [] }
         refresh()
         status = "Removed \(paper.title.isEmpty ? paper.arxivID : String(paper.title.prefix(40)))"
     }
@@ -84,6 +109,7 @@ final class AppModel {
     /// order you passed them in, so selecting three and choosing Read next reads
     /// them in the order you picked.
     func queue(_ ids: [String], atFront: Bool = true) {
+        guard flushDraft() else { return }
         let changed = ReadingQueue.adding(ids, to: Library.shared.papers, atFront: atFront)
         guard !changed.isEmpty else { return }
         Library.shared.batch({ "queue: \($0) papers" }) {
@@ -97,6 +123,7 @@ final class AppModel {
     }
 
     func unqueue(_ ids: [String]) {
+        guard flushDraft() else { return }
         let changed = ReadingQueue.removing(ids, from: Library.shared.papers)
         guard !changed.isEmpty else { return }
         Library.shared.batch({ "queue: removed \($0) papers" }) {
@@ -110,14 +137,16 @@ final class AppModel {
     var upNext: [Paper] { ReadingQueue.ordered(papers) }
 
     func toggleStar(_ paper: Paper) {
-        var p = paper
+        guard flushDraft() else { return }
+        var p = Library.shared.paper(withID: paper.id) ?? paper
         p.starred.toggle()
-        Library.shared.save(p)
-        if draft?.arxivID == p.arxivID { draft?.starred = p.starred }
+        guard Library.shared.save(p) != nil else { return }
+        if draft?.arxivID == p.arxivID { draft = p; baseline = p }
         refresh()
     }
 
     func refresh() {
+        guard flushDraft() else { return }
         Library.shared.reload()
         papers = SortOrder.apply(sort, to: Library.shared.papers)
         unpushed = Git.unpushedCount
@@ -125,17 +154,18 @@ final class AppModel {
     }
 
     func select(_ id: String) {
+        guard flushDraft() else { return }
         selectedID = id
         guard let p = Library.shared.paper(withID: id) else { draft = nil; related = []; return }
-        draft = p
+        draft = p; baseline = p
         related = Relations.related(to: p, in: papers)
     }
 
     func save() {
         guard var p = draft else { return }
         if p.readOn == nil { p.readOn = Date() }
-        Library.shared.save(p)
-        draft = p
+        guard Library.shared.save(p) != nil else { return }
+        draft = p; baseline = p
         status = "Saved · \(p.arxivID)"
         refresh()
         select(p.arxivID)
@@ -193,7 +223,7 @@ final class AppModel {
         }
         paper.readOn = Date()
 
-        Library.shared.save(paper)
+        guard Library.shared.save(paper) != nil else { return }
         refresh()
         select(paper.arxivID)
         showingAdd = false
@@ -278,7 +308,7 @@ final class AppModel {
 
     /// Opens the PDF for reading and gets the two windows onto different screens.
     func startReading(_ paper: Paper) {
-        guard !paper.pdfPath.isEmpty else { return }
+        guard flushDraft(), paper.resolvedPDF != nil else { return }
         Reading.openPDF(paper.resolvedPDF?.path ?? paper.pdfPath)
         // Preview needs a moment to put a window on screen before we can tell
         // which display to avoid.

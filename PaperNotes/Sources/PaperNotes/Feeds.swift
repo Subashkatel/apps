@@ -86,20 +86,7 @@ enum ArxivFeed {
         Library.root.appendingPathComponent("arxiv-categories.txt")
     }
 
-    private static let defaults = """
-    # arXiv categories to watch for brand-new papers, one per line.
-    #
-    # Everything posted to these in the last few weeks is fetched and scored
-    # against your library's own vocabulary; only the closest handful reach the
-    # judge. Widening this costs a little time, not accuracy — the scoring is
-    # what decides relevance.
-
-    cs.LG
-    cs.CL
-    cs.AI
-    cs.CR
-    stat.ML
-    """
+    private static let defaults = "# arXiv categories to follow, one per line (for example cs.LG).\n"
 
     static func bootstrap() {
         if !FileManager.default.fileExists(atPath: categoriesURL.path) {
@@ -130,8 +117,7 @@ enum ArxivFeed {
         static let lifetime: TimeInterval = 6 * 3600
 
         static var directory: URL {
-            FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/PaperNotes/feeds")
+            Library.root.appendingPathComponent("feeds")
         }
 
         static func url(_ key: String) -> URL {

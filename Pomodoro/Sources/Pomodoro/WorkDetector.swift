@@ -1,3 +1,4 @@
+import LocalSupport
 import AppKit
 import CoreGraphics
 import Observation
@@ -169,33 +170,13 @@ final class WorkDetector {
 /// The set of apps that count as working. Plain text so it can be edited without a
 /// rebuild; matched on bundle identifier or on the app's display name.
 enum WorkApps {
-    static let fileURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".config/pomodoro/work-apps.txt")
+    static let fileURL = LocalConfig.path("pomodoroWorkAppsFile", environment: "POMODORO_WORK_APPS")
+        ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/pomodoro/work-apps.txt")
 
     private static let defaults = """
-    # Apps that count as "working". When one of these holds focus for 30 seconds
-    # and the timer is idle, a focus session starts by itself.
-    #
-    # One per line. Either a bundle identifier or the app's display name — the name
-    # is easier to read, the bundle id is unambiguous. Case-insensitive.
-    # Re-read on every check, so edits take effect immediately.
-    #
-    # Find an app's bundle id with:
-    #   osascript -e 'id of app "Cursor"'
-
-    Cursor
-    com.todesktop.230313mzl4w4u92
-    iTerm2
-    com.googlecode.iterm2
-    Code
-    com.microsoft.VSCode
-    Terminal
-    Ghostty
-
-    # Deliberately absent: browsers, Slack, Notion. Reading documentation in Chrome
-    # is work, but *starting* a session because Chrome came forward would fire
-    # constantly. Focus starts on a clear signal and stops on inactivity, not on
-    # every app switch.
+    # Apps that trigger the configured focus reminder (Ask me by default).
+    # Add a display name or bundle identifier per line. Changes apply immediately.
+    # Example: com.apple.Terminal
     """
 
     static func bootstrap() {

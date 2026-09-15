@@ -1,3 +1,4 @@
+import LocalSupport
 import Foundation
 import PDFKit
 
@@ -15,8 +16,7 @@ final class Library {
     /// markdown, so nothing about how you read, grep or push it changes; only
     /// where it sits. Never inside the `.app` bundle: `build.sh` replaces that
     /// on every rebuild, which would take the library with it.
-    nonisolated static let root = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Paper Notes")
+    nonisolated static let root = LocalConfig.dataDirectory("Paper Notes")
 
     /// Where the library used to live.
     nonisolated private static let legacyRoot = FileManager.default
@@ -46,31 +46,29 @@ final class Library {
     /// Verifies the copy opens before reporting success — a truncated copy that
     /// still lets you delete the original would be the worst possible outcome.
     nonisolated static func adopt(_ source: URL, for id: String) -> String? {
-        let fm = FileManager.default
-        try? fm.createDirectory(at: pdfStore, withIntermediateDirectories: true)
-        let destination = pdfStore.appendingPathComponent("\(PDFRefs.normalise(id)).pdf")
-
-        if source.standardizedFileURL == destination.standardizedFileURL {
-            return destination.path                       // already adopted
-        }
-        guard fm.fileExists(atPath: source.path) else { return nil }
-        if fm.fileExists(atPath: destination.path) { try? fm.removeItem(at: destination) }
-        do { try fm.copyItem(at: source, to: destination) } catch { return nil }
-
-        guard let copied = PDFDocument(url: destination), copied.pageCount > 0 else {
-            try? fm.removeItem(at: destination)
-            return nil
-        }
-        return destination.path
+        let destination = pdfStore.appendingPathComponent(LocalFiles.safeName("\(PDFRefs.normalise(id)).pdf"))
+        if source.standardizedFileURL == destination.standardizedFileURL { return destination.path }
+        guard let data = try? Data(contentsOf: source),
+              let pdf = PDFDocument(data: data), pdf.pageCount > 0 else { return nil }
+        do {
+            try FileManager.default.createDirectory(at: pdfStore, withIntermediateDirectories: true)
+            try data.write(to: destination, options: .atomic)
+            return destination.path
+        } catch { return nil }
     }
-    nonisolated static let remote = "https://github.com/narutatsuri/paper-notes.git"
+    nonisolated static var remote: String? {
+        LocalConfig.string("paperNotesRemote", environment: "PAPER_NOTES_REMOTE")
+    }
 
     private(set) var papers: [Paper] = []
+    var onSaveError: ((String) -> Void)?
 
     private init() {}
 
     func bootstrap() {
-        Self.migrateFromHome()
+        if LocalConfig.path("dataRoot", environment: "LOCAL_APPS_DATA_ROOT") == nil {
+            Self.migrateFromHome()
+        }
         defer { TrustedAuthors.bootstrap(); ArxivFeed.bootstrap() }
         let fm = FileManager.default
         try? fm.createDirectory(at: Self.papersDir, withIntermediateDirectories: true)
@@ -88,7 +86,7 @@ final class Library {
             references extracted from the PDF, which is what the relation graph is
             built from.
 
-            Managed by the PaperNotes app (`~/Developer/PaperNotes`), but the files
+            Managed by the Paper Notes app, but the files
             are the source of truth and outlive it.
             """.write(to: readme, atomically: true, encoding: .utf8)
         }
@@ -143,22 +141,25 @@ final class Library {
     /// Writes the note, replacing any earlier file for the same paper whose title —
     /// and therefore filename — has since changed.
     @discardableResult
-    func save(_ paper: Paper) -> URL {
-        let fm = FileManager.default
-        try? fm.createDirectory(at: Self.papersDir, withIntermediateDirectories: true)
-
-        let target = Self.papersDir.appendingPathComponent(paper.filename)
-        if let existing = (try? fm.contentsOfDirectory(at: Self.papersDir, includingPropertiesForKeys: nil))?
-            .first(where: { $0.lastPathComponent.hasPrefix(paper.arxivID) && $0 != target }) {
-            try? fm.removeItem(at: existing)
+    func save(_ paper: Paper) -> URL? {
+        let target = Self.papersDir.appendingPathComponent(LocalFiles.safeName(paper.filename))
+        do {
+            let files = (try? FileManager.default.contentsOfDirectory(at: Self.papersDir,
+                includingPropertiesForKeys: nil)) ?? []
+            let previous = files.first { url in
+                guard url.standardizedFileURL.resolvingSymlinksInPath() != target.standardizedFileURL.resolvingSymlinksInPath(), url.pathExtension == "md",
+                      let text = try? String(contentsOf: url, encoding: .utf8),
+                      let stored = Paper(markdown: text) else { return false }
+                return stored.arxivID == paper.arxivID
+            }
+            try LocalFiles.replace(paper.markdown, at: target, retiring: previous)
+        } catch {
+            onSaveError?(error.localizedDescription)
+            return nil
         }
-        try? paper.markdown.write(to: target, atomically: true, encoding: .utf8)
         reload()
-        if batchDepth > 0 {
-            batchTouched += 1
-        } else {
-            Git.commit(at: Self.root, message: commitMessage(for: paper))
-        }
+        if batchDepth > 0 { batchTouched += 1 }
+        else { Git.commit(at: Self.root, message: commitMessage(for: paper)) }
         return target
     }
 
@@ -203,12 +204,12 @@ enum Git {
         return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
     }
 
-    static func ensureRepo(at url: URL, remote: String) {
+    static func ensureRepo(at url: URL, remote: String?) {
         if !FileManager.default.fileExists(atPath: url.appendingPathComponent(".git").path) {
             run(["init", "-b", "main"], at: url)
         }
         let existing = run(["remote", "get-url", "origin"], at: url)
-        if existing.status != 0 {
+        if existing.status != 0, let remote, !remote.isEmpty {
             run(["remote", "add", "origin", remote], at: url)
         }
     }

@@ -1,0 +1,84 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src 'self';">
+<style>
+:root {color-scheme:light dark} *{box-sizing:border-box} body{margin:0;background:#f7f5ef;color:#272b23;font:17px/1.8 Georgia,serif;overflow-wrap:break-word} #article{max-width:900px;margin:auto;padding:24px 30px 70px} h1,h2,h3,h4,h5,h6{font-family:Georgia,serif;font-weight:400;line-height:1.3} h1{font-size:30px} h2{font-size:25px;margin-top:2em} h3{font-size:21px} h4,h5,h6{font-size:18px} p{margin:.9em 0} a{color:#586c3c} .ltx_authors,.ltx_date{font:13px/1.6 -apple-system,sans-serif;opacity:.8} math{font-family:STIX Two Math,STIXGeneral,Cambria Math,serif;font-style:normal;font-size:1.08em} math[display=block]{display:block;overflow-x:auto;margin:1em 0} .ltx_equation,.ltx_eqn_table{display:block;max-width:100%;overflow-x:auto;margin:1.5em 0} .ltx_eqn_cell{padding:4px 8px} .ltx_eqn_eqno{font-size:12px;opacity:.7} figure{margin:28px 0;max-width:100%;overflow-x:auto} figure svg,figure img{background:white;color:#111;max-width:100%;height:auto;padding:10px;display:block;margin:auto} figcaption{font-size:13px;line-height:1.6;margin-top:12px} table{max-width:100%;border-collapse:collapse} th,td{padding:5px;vertical-align:top} .ltx_tabular{font-size:13px;display:block;overflow-x:auto} .ltx_ref_title{font-style:normal} .ltx_biblist{font-size:13px;padding-left:22px} .ltx_note_content{font-size:12px} .ltx_para{margin:12px 0} .ltx_text.ltx_font_bold{font-weight:600} .ltx_font_italic{font-style:italic} .ltx_align_center{text-align:center} @media(prefers-color-scheme:dark){body{background:#232521;color:#ebece5}a{color:#c4d1ab}} @media(max-width:500px){#article{padding:16px 20px 50px}body{font-size:15px}h1{font-size:25px}}
+
+svg foreignObject{overflow:visible;font-family:serif;line-height:1}
+.ltx_foreignobject_container{display:flex;align-items:center;height:100%;width:var(--ltx-fo-width,100%)}
+.ltx_foreignobject_content{display:block;color:#111;font-family:serif;font-size:1em;line-height:1;width:inherit}
+.ltx_foreignobject_content *{line-height:1.1}
+.ltx_foreignobject_content p{margin:0;padding:0}
+.ltx_foreignobject_content math{font-size:1em}
+.ltx_minipage,.ltx_parbox{width:inherit}
+details{font-size:13px;margin-bottom:20px}summary{cursor:pointer}details a{display:block;padding:3px 0}
+svg .ltx_foreignobject_content{white-space:nowrap}
+svg .ltx_tabular{display:table;font-size:inherit;overflow:visible;width:auto}
+svg th,svg td{padding:0;line-height:1.15}
+svg .ltx_foreignobject_container{align-items:end}
+svg .ltx_foreignobject_container:has(>.ltx_foreignobject_content>math:only-child){align-items:center}
+#frontier-marks{position:absolute;inset:0;pointer-events:none} .frontier-highlight{position:absolute;pointer-events:none;border-radius:2px;mix-blend-mode:multiply} .frontier-note{position:absolute;pointer-events:auto;width:23px;height:23px;border:1px solid #778363;border-radius:5px;background:#f7f5ef;color:#273e32;cursor:pointer;font:11px -apple-system,sans-serif} @media(prefers-color-scheme:dark){.frontier-highlight{mix-blend-mode:screen}.frontier-note{background:#232521;color:#eeeee7;border-color:#c4d4af}} #article{padding-right:42px}
+</style></head><body><main id="article"></main><div id="frontier-marks"></div><script>
+let readingReady=false, scrollTimer;
+function readingPosition(){
+ const items=[...document.querySelectorAll('.ltx_para[id],figure[id],section[id]')];
+ const anchor=items.filter(e=>e.getBoundingClientRect().top<=28).at(-1);
+ return {anchor:anchor?.id||'',offset:anchor?anchor.getBoundingClientRect().top: -scrollY};
+}
+window.addEventListener('scroll',()=>{if(!readingReady)return;clearTimeout(scrollTimer);scrollTimer=setTimeout(()=>window.webkit?.messageHandlers?.articlePosition?.postMessage({...readingPosition(),context:articleContext()}),200)});
+window.renderArticle=async(raw,base,position={})=>{
+ const doc=new DOMParser().parseFromString(raw,'text/html');
+ for(const object of doc.querySelectorAll('object[type="image/svg+xml"]')) {const img=doc.createElement('img');for(const attr of [...object.attributes])if(attr.name!=='type'&&attr.name!=='data')img.setAttribute(attr.name,attr.value);img.src=object.getAttribute('data')||'';img.alt='Figure; see caption';object.replaceWith(img);}
+ doc.querySelectorAll('script,style,link,iframe,object,embed,form,input,button,meta,base,animate,set').forEach(e=>e.remove());
+ for(const el of doc.querySelectorAll('*')) {
+  for(const attr of [...el.attributes]) {
+   const name=attr.name.toLowerCase(),v=attr.value.trim();
+   if(name.startsWith('on')||['srcdoc','srcset','action','formaction'].includes(name)||name==='style'&&/url\s*\(|expression\s*\(/i.test(v))el.removeAttribute(attr.name);
+   if(['href','xlink:href'].includes(name)&&!v.startsWith('#')){
+    if(el.tagName.toLowerCase()==='a'){try{const u=new URL(v,base);if(['https:','http:','mailto:'].includes(u.protocol))el.setAttribute(attr.name,u.href);else el.removeAttribute(attr.name)}catch{el.removeAttribute(attr.name)}}else el.removeAttribute(attr.name);
+   }
+   if(name==='src'&&!/^data:image\/(png|jpeg|svg\+xml|webp|gif);base64,/i.test(v))el.removeAttribute(attr.name);
+  }
+ }
+ document.querySelector('#article').replaceChildren(...doc.body.childNodes);
+ const headings=[...document.querySelectorAll('section[id]')].filter(e=>e.querySelector(':scope>h2,:scope>h3'));
+ if(headings.length){const contents=document.createElement('details');contents.innerHTML='<summary>Contents</summary>';const links=document.createElement('div');for(const h of headings){const a=document.createElement('a');a.href='#'+h.id;a.textContent=h.querySelector('h2,h3').textContent;links.append(a)}contents.append(links);document.querySelector('#article').prepend(contents)}
+ await Promise.all([...document.images].map(i=>i.decode().catch(()=>{})));
+ const anchor=position.anchor&&document.getElementById(position.anchor);
+ if(anchor){anchor.scrollIntoView();window.scrollBy(0,-(position.offset||0))}else if(!position.anchor&&position.offset)window.scrollTo(0,-position.offset);
+ articleTextMap=null;readingReady=true;drawArticleMarks();
+ window.webkit?.messageHandlers?.articleNotes?.postMessage({context:articleContext()});
+ return {math:document.querySelectorAll('math').length,figures:document.querySelectorAll('figure').length};
+};
+// Annotation overlays never rewrite article, figure, or MathML nodes.
+let articleMarks=[],articleTextMap=null,articleRanges=new Map(),annotationFrame;
+const normalizedText=s=>s.replace(/[\s\u00ad]/gu,'').toLowerCase();
+function textMap(){
+ const walker=document.createTreeWalker(document.getElementById('article'),NodeFilter.SHOW_TEXT),positions=[],parts=[];
+ while(walker.nextNode()){
+  const node=walker.currentNode;if(node.parentElement.closest('details,annotation,annotation-xml,script,style'))continue;
+  let offset=0;for(const ch of node.textContent){const value=normalizedText(ch);for(let i=0;i<value.length;i++){parts.push(value[i]);positions.push({node,offset,end:offset+ch.length})}offset+=ch.length}
+ }
+ return {text:parts.join(''),positions};
+}
+function drawArticleMarks(){
+ const layer=document.getElementById('frontier-marks');layer.replaceChildren();articleRanges.clear();
+ if(!articleTextMap)articleTextMap=textMap();const {text,positions}=articleTextMap;let lastMarker=-30;
+ for(const [index,mark] of articleMarks.entries()){
+  const quote=normalizedText(mark.quote||'');if(quote.length<12)continue;
+  const start=text.indexOf(quote);if(start<0||text.indexOf(quote,start+1)>=0)continue;
+  const first=positions[start],last=positions[start+quote.length-1];if(!first||!last)continue;
+  const range=document.createRange();range.setStart(first.node,first.offset);range.setEnd(last.node,last.end);articleRanges.set(mark.id,range);
+  const rects=[...range.getClientRects()].filter(r=>r.width>0&&r.height>0);if(!rects.length)continue;
+  for(const rect of rects){const tint=document.createElement('span');tint.className='frontier-highlight';Object.assign(tint.style,{left:rect.left+scrollX+'px',top:rect.top+scrollY+'px',width:rect.width+'px',height:rect.height+'px',background:mark.color});layer.append(tint)}
+  const rect=rects[0],button=document.createElement('button');button.className='frontier-note';button.textContent=String(index+1);button.setAttribute('aria-label','Open note '+(index+1));button.style.top=Math.max(rect.top+scrollY,lastMarker+26)+'px';lastMarker=parseFloat(button.style.top);button.style.left=Math.min(innerWidth-29,document.getElementById('article').getBoundingClientRect().right-24)+'px';button.onclick=()=>window.webkit?.messageHandlers?.articleNotes?.postMessage({note:mark.id});layer.append(button);
+ }
+ return articleRanges.size;
+}
+window.setArticleMarks=marks=>{articleMarks=marks;return drawArticleMarks()};
+window.revealArticleMark=id=>{const range=articleRanges.get(id);if(!range)return false;window.scrollTo({top:range.getBoundingClientRect().top+scrollY-70,behavior:'auto'});return true};
+new ResizeObserver(()=>{cancelAnimationFrame(annotationFrame);annotationFrame=requestAnimationFrame(()=>{if(readingReady)drawArticleMarks()})}).observe(document.getElementById('article'));
+let selectionTimer;
+document.addEventListener('selectionchange',()=>{clearTimeout(selectionTimer);selectionTimer=setTimeout(()=>{const selection=getSelection(),article=document.getElementById('article');const text=selection?.rangeCount&&article.contains(selection.getRangeAt(0).commonAncestorContainer)?selection.toString().slice(0,24000):'';window.webkit?.messageHandlers?.articleNotes?.postMessage({selection:text})},100)});
+function articleContext(){const paragraphs=[...document.querySelectorAll('#article p')];const first=paragraphs.findIndex(p=>p.getBoundingClientRect().bottom>0);return paragraphs.slice(Math.max(0,first-1),Math.max(0,first-1)+5).map(p=>p.textContent).join('\n\n').slice(0,24000)}
+
+</script></body></html>

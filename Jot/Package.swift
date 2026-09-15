@@ -6,5 +6,6 @@ import PackageDescription
 let package = Package(
     name: "Jot",
     platforms: [.macOS(.v14)],
-    targets: [.executableTarget(name: "Jot", path: "Sources/Jot")]
+    dependencies: [.package(path: "../Shared")],
+    targets: [.executableTarget(name: "Jot", dependencies: [.product(name: "LocalSupport", package: "Shared")], path: "Sources/Jot")]
 )

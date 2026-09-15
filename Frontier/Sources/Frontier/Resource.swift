@@ -18,7 +18,7 @@ import PDFKit
 /// 3. A PDF is split by its outline where it has one, and by fixed page windows
 ///    where it does not.
 enum Resource {
-    struct Section: Equatable {
+    struct Section: Equatable, Codable {
         var title: String
         var text: String
     }
@@ -27,24 +27,97 @@ enum Resource {
         var name: String
         var origin: String        // what was asked for, kept for provenance
         var sections: [Section]
+        var original: Original? = nil
+    }
+
+    struct Original {
+        var filename: String
+        var data: Data
     }
 
     // MARK: - Entry
 
     static func load(_ spec: String, nameOverride: String? = nil) -> Loaded? {
-        if spec.hasPrefix("http://") || spec.hasPrefix("https://") {
-            guard let url = URL(string: spec) else { return nil }
-            return web(url, nameOverride: nameOverride)
+        try? read(spec, nameOverride: nameOverride)
+    }
+
+    static func read(_ raw: String, nameOverride: String? = nil) throws -> Loaded {
+        let spec = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = URL(string: spec), ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+            guard url.host != nil else { throw FrontierError("The URL is invalid.") }
+            let arxiv = arxivID(url)
+            let downloadURL = arxiv.map { URL(string: "https://arxiv.org/pdf/" + $0)! } ?? url
+            let result = try download(downloadURL)
+            let ext = result.data.starts(with: Data("%PDF-".utf8)) ? "pdf" : downloadURL.pathExtension.lowercased()
+            if ResourceFiles.extensions.contains(ext), !["html", "htm", "xhtml"].contains(ext) {
+                return try document(result.data, filename: (arxiv ?? downloadURL.deletingPathExtension().lastPathComponent) + "." + ext,
+                                    origin: arxiv.map { "https://arxiv.org/abs/" + $0 } ?? url.absoluteString,
+                                    nameOverride: nameOverride)
+            }
+            if arxiv != nil { throw FrontierError("arXiv did not return a PDF. Please try again, or download the PDF in your browser and choose that file.") }
+            guard let html = String(data: result.data, encoding: .utf8),
+                  let loaded = web(url, nameOverride: nameOverride, html: html) else {
+                throw FrontierError("Could not read this page. Choose a downloadable PDF, EPUB, or text document.")
+            }
+            return loaded
         }
-        let url = URL(fileURLWithPath: (spec as NSString).expandingTildeInPath)
-        guard url.pathExtension.lowercased() == "pdf",
-              FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return pdf(url, nameOverride: nameOverride)
+        let url: URL
+        if spec.hasPrefix("file:") {
+            guard let file = URL(string: spec), file.isFileURL else { throw FrontierError("The file URL is invalid.") }
+            url = file
+        } else { url = URL(fileURLWithPath: (spec as NSString).expandingTildeInPath) }
+        if url.pathExtension.lowercased() == "pdf" {
+            guard let loaded = pdf(url, nameOverride: nameOverride) else { throw FrontierError("No readable PDF text was found. Scanned PDFs need OCR before importing.") }
+            return loaded
+        }
+        return try ResourceFiles.read(url, nameOverride: nameOverride)
+    }
+
+    /// Abstract, HTML and extensionless PDF links refer to the same arXiv item.
+    static func arxivID(_ url: URL) -> String? {
+        guard ["arxiv.org", "www.arxiv.org", "export.arxiv.org"].contains(url.host?.lowercased() ?? "") else { return nil }
+        let path = url.path.replacingOccurrences(of: #"^/(abs|pdf|html)/"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\.pdf$"#, with: "", options: .regularExpression)
+        guard path.range(of: #"^(\d{4}\.\d{4,5}|[a-zA-Z.-]+/\d{7})(v\d+)?$"#, options: .regularExpression) != nil else { return nil }
+        return path
+    }
+    static func canonicalOrigin(_ raw: String) -> String {
+        guard let url = URL(string: raw), let id = arxivID(url) else { return raw }
+        return "https://arxiv.org/abs/" + id
+    }
+    static func document(_ data: Data, filename: String, origin: String, nameOverride: String? = nil) throws -> Loaded {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent(URL(fileURLWithPath: filename).lastPathComponent)
+        try data.write(to: file)
+        var loaded = try read(file.path, nameOverride: nameOverride)
+        loaded.origin = origin
+        loaded.original = Original(filename: file.lastPathComponent, data: data)
+        return loaded
+    }
+    private final class DownloadResult: @unchecked Sendable {
+        var data: Data?; var status = 0; var error: Error?
+    }
+    private static func download(_ url: URL) throws -> (data: Data, status: Int) {
+        let done = DispatchSemaphore(value: 0), result = DownloadResult()
+        var request = URLRequest(url: url, timeoutInterval: 40)
+        request.setValue("Mozilla/5.0 (Macintosh) Frontier/1.1", forHTTPHeaderField: "User-Agent")
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            result.data = data; result.status = (response as? HTTPURLResponse)?.statusCode ?? 0; result.error = error
+            done.signal()
+        }
+        task.resume()
+        guard done.wait(timeout: .now() + 45) == .success else { task.cancel(); throw FrontierError("The document download timed out. Please try again.") }
+        if let error = result.error { throw FrontierError("Could not download the document: " + error.localizedDescription) }
+        guard (200..<300).contains(result.status) else { throw FrontierError("The website returned HTTP \(result.status). Try downloading the document in your browser.") }
+        guard let data = result.data, !data.isEmpty, data.count <= 100_000_000 else { throw FrontierError("The download is empty or larger than 100 MB.") }
+        return (data, result.status)
     }
 
     // MARK: - Web
 
-    private static func web(_ url: URL, nameOverride: String?) -> Loaded? {
+    private static func web(_ url: URL, nameOverride: String?, html: String) -> Loaded? {
         // A site root gets the llms-full.txt shortcut; a specific page was asked
         // for as a page, and gets read as one even when the site has the file.
         let isRoot = url.path.isEmpty || url.path == "/"
@@ -61,7 +134,6 @@ enum Resource {
             return Loaded(name: name, origin: url.absoluteString, sections: sections)
         }
 
-        guard let html = fetch(url) else { return nil }
         // "Post title | site name" is two facts; the resource is the first one.
         let name = nameOverride
             ?? pageTitle(html)?.components(separatedBy: " | ").first?
@@ -220,7 +292,7 @@ enum Resource {
             for (i, b) in bounds.enumerated() {
                 let end = i + 1 < bounds.count ? bounds[i + 1].page : doc.pageCount
                 let text = pageText(doc, from: b.page, to: end)
-                if text.count > 200 { sections.append(Section(title: b.title, text: text)) }
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { sections.append(Section(title: b.title, text: text)) }
             }
         } else {
             // No usable outline: fixed windows, titled by page range so the
@@ -230,7 +302,7 @@ enum Resource {
             while start < doc.pageCount {
                 let end = min(start + window, doc.pageCount)
                 let text = pageText(doc, from: start, to: end)
-                if text.count > 200 {
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     sections.append(Section(title: "Pages \(start + 1)–\(end)", text: text))
                 }
                 start = end
@@ -253,13 +325,24 @@ enum Resource {
     /// One call per chapter of a twenty-chapter book is twenty minutes of model
     /// time; one call per *paragraph* would be a day.
     static func batches(_ sections: [Section], cap: Int = 26_000) -> [[Section]] {
+        guard cap > 0 else { return [] }
         var split: [Section] = []
         for s in sections {
             if s.text.count <= cap { split.append(s); continue }
             var part = 1
             var current = ""
-            for para in s.text.components(separatedBy: "\n\n") {
-                if current.count + para.count > cap, !current.isEmpty {
+            for paragraph in s.text.components(separatedBy: "\n\n") {
+                var remainder = paragraph
+                while remainder.count > cap {
+                    if !current.isEmpty {
+                        split.append(Section(title: "\(s.title) (part \(part))", text: current))
+                        part += 1; current = ""
+                    }
+                    split.append(Section(title: "\(s.title) (part \(part))", text: String(remainder.prefix(cap))))
+                    remainder = String(remainder.dropFirst(cap)); part += 1
+                }
+                let para = remainder
+                if current.count + para.count + (current.isEmpty ? 0 : 2) > cap, !current.isEmpty {
                     split.append(Section(title: "\(s.title) (part \(part))", text: current))
                     part += 1
                     current = ""

@@ -1,244 +1,53 @@
 # Paper Notes
 
-Reading notes for papers, with a citation graph as the spine. Notes are markdown in
-a git repo you own (`~/Library/Application Support/Paper Notes` →
-`github.com/narutatsuri/paper-notes`); the app
-is a lens over those files, never their owner.
+PDF reading notes with a citation graph, reading queue, metadata, recommendations, AI appraisal and note grading.
 
-Built 2026-08-04.
+Build: `./build.sh PaperNotes` from the repository root. Install: `./install.sh PaperNotes`.
 
-## Why this shape
+Add a PDF through Finder's Open With menu, the app's add dialog, or drag and drop. The original PDF opens in your reader; notes remain editable markdown. The app extracts references locally and retrieves metadata from arXiv, OpenAlex and Semantic Scholar. AI features use the provider selected in **AI settings**.
 
-The problem was not capture. Capture had already been built three times:
+## Reviewing a paper
 
-- **Zotero** — 306 papers, 49 notes, then abandoned. Items added per month:
-  `2025-12: 179 → 2026-01: 51 → 02: 38 → 03: 12 → 04: 26 → nothing after 13 April.`
-- **Obsidian** — a vault registered in December, dormant.
-- An **AI summary pipeline** — a careful rubric (GOLD/SOLID/MIXED/THIN/GARBAGE,
-  "if a value is not in the paper write *not reported*") that produced 80 summaries
-  for 88 papers, and works.
+The app opens in dark mode with **Preview** selected. Choose **Write** to edit Markdown, or **Split** to see writing and formatted text together. The menu's **Dark appearance** toggle also allows light mode. Your verdict and star stay separate from the AI's appraisal.
 
-306 captured papers, and still "I forget I even read it." **What was missing was
-anything that brings a paper back.** So the design centres on the relation graph: a
-reason to return, which grows as you read. Capture tools decay because nothing there
-ever gets denser.
+**Prompts & review tools** holds optional headings for claims, evidence, assumptions, understanding, gaps and connections, plus the AI appraisal and note grading controls. Adding a prompt appends a missing heading; it never replaces your writing.
 
-The summaries stay useful for triage — deciding what to read. They are deliberately
-not the note.
+Expand **Connections** to see citation and topic links, or choose **Add connection** to select another paper and write your own reason. These explicit links are stored in the note's frontmatter and appear in the graph. Command-click sidebar rows to select several papers for queue actions. Search includes note text.
 
-## The citation graph, and why it comes from PDFs
+Frontier's **Use in Paper Notes** action appends a selected annotation to the corresponding review, preserves existing text and verdicts, and adopts a copy of the original PDF. **Return to source** opens the exact page/annotation in Frontier. Sending a passage does not invoke AI. Repeating the same handoff does not duplicate the passage; later annotation edits do not automatically overwrite the review.
 
-A connectedpapers-style graph needs reference lists. The free APIs do not have them
-for the papers actually being read:
+Drafts save before switching papers and on quitting. The Save button also marks the paper as read. Failed saves keep the draft and prevent switching. PDF annotation editing lives in Frontier; **Open PDF** here uses your normal PDF app. Both apps remain usable independently. Zotero is not required.
 
-| Paper | OpenAlex `referenced_works` |
-|---|---|
-| GPT-3 (2020) | 127 |
-| Geometry of Truth (2023) | **0** |
-| `2412.04984` (Dec 2024) | **0** |
-| `2510.23966` (Oct 2025) | **0** |
+## Storage and sync
 
-Reference lists exist only for older published work; every recent arXiv preprint
-returns nothing. Semantic Scholar *does* index preprint references but rate-limits
-unauthenticated callers (`429`).
+The default library is `~/Library/Application Support/Paper Notes`, configurable through `dataRoot`:
 
-So references are extracted from the PDFs, via PDFKit, with no dependency and no API.
-Measured over 82 AI-safety PDFs: **median 19 references per paper, zero papers
-yielding none, 1,911 edges total.**
+- `papers/`: Markdown notes, including personal connection reasons in the `connections` JSON frontmatter field.
+- `pdfs/`: adopted PDF copies, excluded from Git.
+- `trusted-authors.txt`: your followed authors, initially empty.
+- `arxiv-categories.txt`: categories you want fresh-paper recommendations from, initially empty.
+- `not-interested.txt`: dismissed recommendations.
 
-One trap worth recording: matching only the literal `arXiv:` form finds a small
-fraction of citations, because many papers cite by URL. The pattern must also accept
-`arxiv.org/abs/…` and `arxiv.org/pdf/…`. That single fix took median references from
-1 to 19.
+Local Git history is initialized automatically. No remote is assigned by default. Set `paperNotesRemote` to your own Git repository URL, or configure `origin` manually in the library. An existing remote is preserved. Git commit identity and authentication must be configured on your Mac. Turn on pushing in the app when ready to sync.
 
-OpenAlex is still used, but **for metadata only** — title, authors, year, venue —
-which it returns reliably even when references are empty.
+Saved notes are written atomically before an old filename is removed. A failed save reports an error and keeps the current editor draft; resolve the storage issue and retry before switching papers. Adopted PDFs are validated before replacing a stored copy.
 
-## Edges
+## Checks and limitations
 
-| Kind | Meaning | Weight |
-|---|---|---|
-| `cites` / `citedBy` | one paper's bibliography contains the other | 1.0 |
-| `coupling` | shared references — the connectedpapers signal | 0.7 × saturating |
-| `topical` | title term overlap, minus field-wide stopwords | 0.3 × saturating |
+`--selftest` tests parsing, ordering, recommendations and graph logic. Tests use synthetic inputs and do not call live AI or metadata services. Set `PAPER_NOTES_TEST_PDFS` to explicitly opt into observing a local PDF corpus when invoking `--selftest` directly. The test runner isolates storage.
 
-Coupling saturates at 12 shared references rather than scaling linearly: 40 shared
-refs is not four times more meaningful than 10, it mostly means both bibliographies
-are long. Each pair of papers yields one relation — the strongest reason wins — so
-the panel reads as a list of papers, not a list of reasons.
+The native review window and the actual application window were checked with isolated sample notes, including dark styling and LaTeX. Run `--review-preview <output.png>` with `LOCAL_APPS_TESTING=1` and a temporary `LOCAL_APPS_DATA_ROOT` for the interactive layout check. See [HANDOFF.md](../HANDOFF.md).
 
-## The reading loop
+Local handoff packets live in `<dataRoot>/Reading Bridge/inbox`; they contain only the explicitly selected passage, note, source metadata and local original path. URL events carry an inbox identifier. Back up both app data directories to retain cross-app source links.
 
-1. Download a PDF.
-2. In Finder, right-click → **Services → Add to Paper Notes** (or *Open With → Paper
-   Notes*, or drop it on the window). All three land in `AppModel.ingest`.
-3. The PDF opens in Preview, references are pulled from it, metadata from OpenAlex,
-   and the notes window moves to a display Preview isn't using.
-4. Write. The right pane renders as you type.
+## AI discussions and original PDFs
 
-`LSHandlerRank` is `Alternate` on purpose — Preview stays the default PDF handler,
-because reading happens there and this app only wants the file.
+The bottom bar's **AI settings** chooses Claude, Codex, Gemini or a custom Chat Completions server. Paper Notes initially uses Frontier's existing configuration, then saves an independent provider choice when you press Save. Gemini uses an existing Google login through the supported Antigravity CLI (`agy`); **Sign in in Terminal** starts Google setup. The older Gemini CLI personal login is retired; old executable overrides resolve to `agy`. [Google setup guide](https://antigravity.google/docs/cli/install/). AI Pro/student subscription eligibility depends on the signed-in Google account, and is separate from Gemini API billing.
 
-With **three displays** attached, no automatic arrangement is right, so
-`placeNotesAwayFrom` only moves the window when it would otherwise share a screen
-with Preview. It finds Preview's screen through `CGWindowListCopyWindowInfo`, which
-needs no Accessibility permission. `⌃⌘D` moves the window on manually.
+**Discuss** opens an optional panel beside your review. It includes your current draft, an extracted excerpt of up to 20 PDF pages / 60,000 characters, and the conversation's earlier turns. Excerpts may omit later pages, figures and mathematical structure; verify against the original. Conversation history saves locally and never edits your review automatically. **Add to my review** explicitly inserts a labeled AI excerpt into your draft.
 
-## The note
+**Open PDF** opens an attached original in your PDF app. If no readable original is attached, the header instead offers **Attach PDF**. This is also available for local, non-arXiv papers received from Frontier.
 
-Edited as **one markdown document** with the prompts as headings, not as separate
-fields. Five text boxes cannot host LaTeX or a live preview, and "just drop down
-notes" is not a form. The file format is unchanged either way — the headings are
-still parsed for the section text.
+The AI control shows the selected provider and model; click it to configure them. A blank CLI model is labeled **CLI default**, because the executable chooses the actual model. New discussion replies retain the requested model label from that turn, while older replies say **model not recorded**. The discussion indicator keeps the in-flight selection when settings change. Sign-in opens in its own temporary folder, not your home directory.
 
-Markdown and math render live in the right pane: **marked** for markdown, **KaTeX**
-for `$…$`, `$$…$$`, `\(…\)` and `\[…\]`. Both are bundled into the app (536 KB
-including fonts) rather than loaded from a CDN, so the preview works offline.
-
-One trap: math is extracted and stashed *before* markdown runs. Left to itself,
-marked mangles TeX — `a_b` becomes emphasis and `\\` disappears. The round-trip test
-covers exactly this, asserting a body containing `\epsilon_{\text{miss}}` and a
-display block survives byte-identically.
-
-Five prompts, chosen because a summary structurally cannot answer them for you:
-the claim **in your own words**, what evidence actually convinced you, what would
-have to be true for it to be wrong, **what you did not understand**, and free
-connections. The fourth is the one worth having — confusion is where the next paper
-comes from — and it is the field no summarizer will ever write.
-
-Verdicts reuse the GOLD/SOLID/MIXED/THIN/GARBAGE scale from the existing summary
-rubric, so the two systems share a vocabulary instead of inventing a second scale.
-
-## Files
-
-| File | Role |
-|---|---|
-| `Paper.swift` | the model and its markdown round-trip |
-| `PDFRefs.swift` | citation extraction via PDFKit; id normalisation |
-| `Relations.swift` | edge kinds, scoring, whole-library graph |
-| `Library.swift` | the git working tree, plus a thin git CLI wrapper |
-| `Metadata.swift` | OpenAlex lookup — metadata only, deliberately not references |
-| `MarkdownPreview.swift` | WKWebView preview; bundled KaTeX + marked |
-| `Reading.swift` | opens the PDF, keeps the two windows on different displays |
-| `GraphLayout.swift` | Fruchterman–Reingold, pure and deterministic |
-| `GraphView.swift` | the Canvas graph window (⌘G) |
-| `Importer.swift` | `--import`, headless cataloguing |
-| `SelfTest.swift` | `--selftest` |
-
-## Git
-
-Commit per note (instant, never fails); push on a 120-second timer (needs the
-network, should not sit between you and the next thought). Auth is the `osxkeychain`
-helper over HTTPS, the same path the existing website repo uses — the SSH key on this
-machine is rejected by GitHub and is not involved.
-
-**Pushing is off by default.** The notes record what you did not understand and
-candid verdicts on other people's work. Publishing that is a decision to make
-deliberately, so the toggle sits in the status bar and starts off.
-
-## Self-test
-
-```sh
-"/Applications/Paper Notes.app/Contents/MacOS/PaperNotes" --selftest
-```
-
-Writes nothing. Two halves:
-
-**Asserted** — the markdown round-trip (a lossy one would silently eat notes,
-including the TeX-mangling case above), id normalisation, and the graph scoring
-against *synthetic* papers with known citation relationships: a direct citation
-outranks weaker signals, the reverse edge appears on the other paper, shared
-references make an edge without a citation, an unrelated paper gets none, and edges
-are deduplicated.
-
-**Observed, not asserted** — reference extraction and edge density over whatever PDFs
-are actually on disk.
-
-That split exists because an earlier version asserted edge density over
-`~/Downloads/ai_safety_papers`, and broke the moment those folders were reorganised —
-7 unrelated PDFs legitimately produce almost no edges. It was testing the reading
-pile, not the code. Density is a property of what you read; correctness is not.
-
-## Not built yet
-
-- **Resurfacing.** The graph is the substrate for "you read this before, and it
-  connects" — currently shown at save time and in the graph, but nothing brings a
-  paper back weeks later of its own accord. This is the piece that actually attacks
-  forgetting.
-- **Reference recall.** Extraction only matches arXiv ids. Papers cited by title or
-  DOI alone are invisible to the graph, which is part of why a young library looks
-  sparse.
-- **Backlog import.** 88 + 37 PDFs and 306 Zotero items are untouched by design;
-  the loop should prove itself on new reading first.
-
-## The graph window
-
-`⌘G` opens it in a window of its own — with three displays it earns a screen next to
-the PDF and the notes. Nodes are papers, filled where a note exists and hollow where
-the paper is only catalogued; radius grows with degree. Selecting a node dims
-everything not adjacent to it, and clicking one selects that paper in the main window.
-
-Layout is Fruchterman–Reingold, seeded from a hash of the arXiv id rather than a
-random generator. That matters more than it sounds: a graph that rearranges itself
-every time you open it is one you can never learn the shape of.
-
-**A caution on reading it early.** With seven papers the graph has two edges, and that
-is honest — those papers genuinely share few references. The graph earns its keep once
-the library has topical density, not before. Sparse output is not a bug; it is the
-library telling you what you have actually read.
-
-## Bulk import
-
-```sh
-"/Applications/Paper Notes.app/Contents/MacOS/PaperNotes" --import ~/Downloads
-```
-
-Catalogues every PDF whose filename carries an arXiv id — same pipeline as Finder,
-minus opening each one for reading. Imported papers hold no note, so they appear as
-"catalogued only" until you read them.
-
-## Seeing the layout without screen recording
-
-Screen recording is not permitted on this machine, so `screencapture` fails and every
-layout bug — the title overlapping the note, the editor pushed off the top — was
-invisible to every other check. `ImageRenderer` rasterises SwiftUI offscreen and needs
-no permission:
-
-```sh
-"/Applications/Paper Notes.app/Contents/MacOS/PaperNotes" --snapshot /tmp/e.png 700 460
-```
-
-**It renders `EditorPane`, not `ContentView`.** `NavigationSplitView` needs a real
-window and rasterises as a prohibition glyph; so do `TextEditor`, `WKWebView`,
-`Picker` and `Link`, since all are AppKit-backed. Their *frames* still render, which
-is what layout debugging needs — two bugs were found this way at 620pt and 700pt: the
-authors line clipped, then the verdict picker overflowing the right edge. Both came
-from the six-segment picker sharing a row with the metadata; it now has its own.
-
-**The limitation is real.** Anything caused by the `NavigationSplitView` wrapper, the
-toolbar, or safe-area insets is outside what this can see.
-
-Passing a height of `0` switches it from rendering to **measuring**: it walks every
-paper in the library and prints the height the editor demands for each.
-
-```
-2512.20798  515 pt   1 relation(s)
-2312.16730  474 pt   0 relation(s)     <- 41pt shorter
-spread across papers: 41 pt
-UNSTABLE - the pane resizes when you click a different paper
-```
-
-That is what caught the real bug. The related strip was 54pt tall for a connected
-paper and one line of text for an unconnected one, so every click between the two
-moved everything above it by 41pt. Both the strip and the cards inside it now have
-fixed heights, and the spread is 0.
-
-**Layout rules this app learned the hard way**, all of which cost a round-trip:
-
-- `GeometryReader` is greedy in both axes and reports no ideal size; inside a `VStack`
-  it shoves its siblings out of the frame.
-- A horizontal `ScrollView` is still flexible *vertically*.
-- Anything whose height depends on the selection must be given a fixed height, or the
-  layout moves under the reader.
-- One child of the content stack should carry `layoutPriority(1)` and no `minHeight`,
-  so it absorbs the slack instead of inflating the stack.
+Discussion question drafts survive restarting. Questions are saved before contacting the provider; retrying a failed request does not duplicate them. Incoming replies preserve any follow-up already being typed. A conversation save failure retains the answer with **Retry save**; normal quitting waits for unsaved writing to be saved.

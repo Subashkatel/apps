@@ -6,5 +6,6 @@ import PackageDescription
 let package = Package(
     name: "Frontier",
     platforms: [.macOS(.v14)],
-    targets: [.executableTarget(name: "Frontier", path: "Sources/Frontier")]
+    dependencies: [.package(path: "../Shared")],
+    targets: [.executableTarget(name: "Frontier", dependencies: [.product(name: "LocalSupport", package: "Shared")], path: "Sources/Frontier")]
 )

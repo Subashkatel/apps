@@ -14,7 +14,7 @@
 # self-signed identity, which is what keeps this free of password prompts.
 set -euo pipefail
 
-CN="VoiceBridge Local Signing"
+CN="${SIGNING_IDENTITY:-Local Apps Development}"
 
 if security find-identity -p codesigning 2>/dev/null | grep -q "$CN"; then
   echo "Identity already present:"

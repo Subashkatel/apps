@@ -1,3 +1,4 @@
+import LocalSupport
 import Foundation
 
 enum EndReason: String, Codable {
@@ -50,8 +51,7 @@ struct DaySummary {
 /// Append-only JSONL. One line per interval — cheap to write, trivially greppable,
 /// and safe to accumulate for years.
 enum SessionLog {
-    static let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Pomodoro")
+    static let dir = LocalConfig.dataDirectory("Pomodoro")
     static var fileURL: URL { dir.appendingPathComponent("sessions.jsonl") }
 
     /// Anything shorter than this is a mis-click, not a session.

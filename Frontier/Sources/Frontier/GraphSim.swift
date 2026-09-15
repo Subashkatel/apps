@@ -1,7 +1,4 @@
-// Copied verbatim from Paper Notes. The force simulation knows nothing
-// about papers or concepts — it is ids, edges and masses — so both apps
-// use it unchanged. Copied rather than shared because each app has to
-// build standalone from a clone; a fix here should be applied there too.
+// Frontier’s interactive graph simulation. Initial layouts are computed separately.
 
 import Foundation
 import CoreGraphics
@@ -46,20 +43,26 @@ final class GraphSim {
     var isSettled: Bool { alpha <= alphaMin && dragging == nil }
 
     func load(ids: [String], edges: [(String, String, Double)],
-              masses: [String: Double], size: CGSize) {
-        let seeded = ForceLayout.layout(ids: ids, edges: edges, size: size)
+              masses: [String: Double], size: CGSize, seeded supplied: [String: ForceLayout.Node]? = nil, settled: Bool = false, preservePositions: Bool = true) {
+        let seeded = supplied ?? ForceLayout.layout(ids: ids, edges: edges, size: size)
         self.edges = edges
         boundsRadius = Double(min(size.width, size.height)) * 0.62
         var next: [String: Body] = [:]
         for id in ids {
             let p = seeded[id]?.position ?? CGPoint(x: size.width / 2, y: size.height / 2)
             // Keep momentum across a reload so resizing doesn't teleport everything.
-            next[id] = Body(position: bodies[id]?.position ?? p,
-                            velocity: bodies[id]?.velocity ?? .zero,
+            next[id] = Body(position: preservePositions ? bodies[id]?.position ?? p : p,
+                            velocity: preservePositions ? bodies[id]?.velocity ?? .zero : .zero,
                             mass: max(1, masses[id] ?? 1))
         }
         bodies = next
-        reheat(0.9)
+        if settled { alpha = alphaMin } else { reheat(0.9) }
+    }
+
+    func updateMasses(_ masses: [String: Double]) {
+        var updated = bodies
+        for id in updated.keys { updated[id]?.mass = max(1, masses[id] ?? 1) }
+        bodies = updated
     }
 
     func reheat(_ to: Double = 0.55) {
@@ -86,40 +89,33 @@ final class GraphSim {
             if alpha - alphaMin < 1e-4 { alpha = alphaMin }
         }
 
-        let ids = Array(bodies.keys)
+        let snapshot = bodies
+        var next = snapshot
+        let ids = snapshot.keys.sorted()
+        let positions = ids.map { snapshot[$0]!.position }
+        let masses = ids.map { snapshot[$0]!.mass }
         let k = 105.0
-        var force: [String: CGPoint] = [:]
-
-        for a in ids {
-            guard let ba = bodies[a] else { continue }
-            var fx = 0.0, fy = 0.0
-            for b in ids where a != b {
-                guard let bb = bodies[b] else { continue }
-                var vx = Double(ba.position.x - bb.position.x)
-                var vy = Double(ba.position.y - bb.position.y)
+        var forces = Array(repeating: CGPoint.zero, count: ids.count)
+        // Compute each pair once, using dense arrays rather than repeated
+        // observable dictionary access in the inner loop.
+        for i in ids.indices {
+            for j in (i + 1)..<ids.count {
+                var vx = positions[i].x - positions[j].x
+                var vy = positions[i].y - positions[j].y
                 var d2 = vx * vx + vy * vy
-                if d2 < 0.5 {
-                    // Deterministic nudge rather than a random one, so a reload
-                    // reproduces the same picture.
-                    vx = Double(a.hashValue % 17) - 8
-                    vy = Double(a.hashValue % 13) - 6
-                    d2 = max(0.5, vx * vx + vy * vy)
-                }
-                let d = sqrt(d2)
-                // Repulsion scaled by the other body's mass: big papers push harder.
-                let rep = (k * k) * bb.mass / d2
-                fx += (vx / d) * rep
-                fy += (vy / d) * rep
+                if d2 < 0.5 { vx = Double((i * 7 + j) % 17) - 8; vy = Double((i + j * 3) % 13) - 6; d2 = max(0.5, vx * vx + vy * vy) }
+                let coefficient = k * k / (d2 * sqrt(d2))
+                let fx = vx * coefficient, fy = vy * coefficient
+                forces[i].x += fx * masses[j]; forces[i].y += fy * masses[j]
+                forces[j].x -= fx * masses[i]; forces[j].y -= fy * masses[i]
             }
-            // Gentle pull to centre keeps unconnected papers from wandering off.
-            fx += Double(centre.x - ba.position.x) * 0.9
-            fy += Double(centre.y - ba.position.y) * 0.9
-
-            force[a] = CGPoint(x: fx, y: fy)
+            forces[i].x += (centre.x - positions[i].x) * 0.9
+            forces[i].y += (centre.y - positions[i].y) * 0.9
         }
+        var force = Dictionary(uniqueKeysWithValues: zip(ids, forces))
 
         for (a, b, weight) in edges {
-            guard let ba = bodies[a], let bb = bodies[b] else { continue }
+            guard let ba = snapshot[a], let bb = snapshot[b] else { continue }
             let vx = Double(ba.position.x - bb.position.x)
             let vy = Double(ba.position.y - bb.position.y)
             let d = max(1, sqrt(vx * vx + vy * vy))
@@ -138,7 +134,7 @@ final class GraphSim {
         }
 
         for id in ids {
-            guard var body = bodies[id] else { continue }
+            guard var body = snapshot[id] else { continue }
             if id == dragging {
                 // A held node follows the cursor exactly, and its velocity records
                 // the motion so releasing it throws the node.
@@ -152,7 +148,7 @@ final class GraphSim {
                 if speed > 14 { vx *= 14 / speed; vy *= 14 / speed }
                 body.velocity = CGPoint(x: vx, y: vy)
                 body.position = dragTarget
-                bodies[id] = body
+                next[id] = body
                 continue
             }
             let f = force[id] ?? .zero
@@ -189,8 +185,9 @@ final class GraphSim {
             }
 
             guard body.position.x.isFinite, body.position.y.isFinite else { continue }
-            bodies[id] = body
+            next[id] = body
         }
+        bodies = next
     }
 
     func position(_ id: String) -> CGPoint? { bodies[id]?.position }

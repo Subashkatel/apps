@@ -1,3 +1,4 @@
+import LocalSupport
 import Foundation
 
 struct VBError: Error { let text: String
@@ -7,81 +8,26 @@ struct VBError: Error { let text: String
 /// Everything tunable lives in plain files under ~/.config/voicebridge so the
 /// vocabulary and fix-ups can be edited without rebuilding the app.
 enum Config {
-    static let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".config/voicebridge")
+    static let dir = LocalConfig.path("voiceConfigDirectory", environment: "VOICEBRIDGE_CONFIG_DIR")
+        ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/voicebridge")
     static var vocabularyURL: URL { dir.appendingPathComponent("vocabulary.txt") }
     static var replacementsURL: URL { dir.appendingPathComponent("replacements.txt") }
 
-    static let support = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/VoiceBridge")
-    static var modelURL: URL { support.appendingPathComponent("ggml-small.en.bin") }
+    static let support = LocalConfig.dataDirectory("VoiceBridge")
+    static var modelURL: URL {
+        LocalConfig.path("whisperModel", environment: "WHISPER_MODEL")
+            ?? support.appendingPathComponent("ggml-small.en.bin")
+    }
 
     static var whisperCLI: URL? {
-        ["/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"]
-            .map(URL.init(fileURLWithPath:))
-            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+        LocalConfig.executable("whisperCLI", environment: "WHISPER_CLI", name: "whisper-cli")
     }
 
     // MARK: - Defaults written on first launch
 
-    private static let defaultVocabulary = """
-    # Words fed to whisper as context before it transcribes. Proper nouns and jargon
-    # it would otherwise guess at belong here. This is the layer that turns
-    # "dellaplee" into "della-pli" and "Quinn" into "Qwen".
-    #
-    # ONLY LIST WORDS WHISPER GETS WRONG. Ordinary English it already handles —
-    # "checkpoint", "dataset", "attention", "benchmark" — costs budget and buys
-    # nothing. whisper truncates the prompt near 224 tokens and drops the overflow
-    # silently, so a bloated list quietly stops working.
-    #
-    # Check your budget:  VoiceBridge --status
-    # For one-off stragglers use replacements.txt, which has no length limit.
-    #
-    # Re-read on every transcription — no rebuild, no restart.
+    private static let defaultVocabulary = "# Add words the recognizer gets wrong, such as names and technical terms.\n"
 
-    Cluster: della-pli, della, SLURM, sbatch, srun, squeue, scancel, sacct, salloc,
-    A100, H100.
-
-    Tools: tmux, conda, venv, uv, rsync, scp, JSONL, YAML, TOML, stdout, stderr,
-    Codex.
-
-    Models: Olmo, Qwen, Llama, Mistral, Mixtral, Gemma, DeepSeek, Phi, Falcon,
-    Pythia, BERT, RoBERTa, DeBERTa, T5, CLIP.
-
-    ML: PyTorch, CUDA, HuggingFace, safetensors, vLLM, LoRA, QLoRA, RLHF, DPO, PPO,
-    tokenizer, embeddings, perplexity, logits, softmax, ablation, pretraining,
-    hyperparameter, anisotropy.
-    """
-
-    private static let defaultReplacements = """
-    # Literal fix-ups applied after transcription, one per line: wrong => right
-    # Case-insensitive, whole-word. For whatever the vocabulary prompt still misses.
-    spatch => sbatch
-    s batch => sbatch
-    es batch => sbatch
-    squeue up => squeue
-    tea mux => tmux
-    t mux => tmux
-    TX => tmux
-    della plea => della-pli
-    della ply => della-pli
-    della p l i => della-pli
-
-    # Model names — errors actually observed from whisper, kept as a safety net
-    # for when the audio is noisy or the vocabulary prompt gets crowded out.
-    Quinn => Qwen
-    quen => Qwen
-    kwen => Qwen
-    Gwen => Qwen
-    allmo => Olmo
-    all mo => Olmo
-    Elmo => Olmo
-    mistrial => Mistral
-    lama => Llama
-    hugging face => HuggingFace
-    pie torch => PyTorch
-    pi torch => PyTorch
-    """
+    private static let defaultReplacements = "# Add corrections, one per line: wrong => right\n"
 
     static func bootstrap() {
         let fm = FileManager.default
