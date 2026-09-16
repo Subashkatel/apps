@@ -77,7 +77,7 @@ public struct AISettings: Codable, Equatable {
         return self
     }
 
-    public func arguments() -> [String] {
+    public func arguments(effort: String = "") -> [String] {
         var args: [String]
         if provider == .claude {
             args = ["-p", "--output-format", "text", "--tools", "", "--strict-mcp-config", "--safe-mode", "--no-session-persistence"]
@@ -89,6 +89,10 @@ public struct AISettings: Codable, Equatable {
                     "--color", "never"]
         }
         if !model.isEmpty { args += ["--model", model] }
+        if !effort.isEmpty {
+            if provider == .codex { args += ["-c", "model_reasoning_effort=\"" + effort + "\""] }
+            else if provider == .claude || provider == .gemini { args += ["--effort", effort] }
+        }
         if provider == .codex { args.append("-") }
         return args
     }
@@ -147,7 +151,8 @@ public enum AIClient {
         if choices?.first?["finish_reason"] as? String == "length" { throw LocalAIError("The model's response was cut short. Increase its output limit or use a smaller import.") }
         return text
     }
-    public static func ask(_ prompt: String, settings: AISettings, timeout: TimeInterval) throws -> String {
+    public static func ask(_ prompt: String, settings: AISettings, timeout: TimeInterval, effort: String = "", cancellation: AICancellation? = nil) throws -> String {
+        try cancellation?.check()
         _ = try settings.validated()
         if settings.provider != .server {
             let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("frontier-ai-" + UUID().uuidString)
@@ -163,13 +168,26 @@ public enum AIClient {
                 let turn: [String: Any] = ["event": "user", "message": ["content": prompt]]
                 input = try JSONSerialization.data(withJSONObject: turn); input.append(10)
             }
-            let data = try LocalProcess.run(settings.executable!, arguments: settings.arguments(), input: input, directory: scratch, timeout: timeout, environment: environment)
-            if settings.provider == .gemini { return try antigravityResponse(data) }
+            if settings.provider == .gemini {
+                let deadline=Date().addingTimeInterval(timeout)
+                for attempt in 0..<2 {
+                    let remaining=deadline.timeIntervalSinceNow
+                    do {
+                        let args=settings.arguments(effort: effort)+["--print-timeout", "\(max(1,Int(remaining)-2))s"]
+                        let data=try LocalProcess.run(settings.executable!,arguments:args,input:input,directory:scratch,timeout:max(1,remaining),environment:environment,cancellation:cancellation)
+                        return try antigravityResponse(data)
+                    } catch let error as LocalAIError where error.retryable && attempt == 0 && deadline.timeIntervalSinceNow > 10 {
+                        Thread.sleep(forTimeInterval:1)
+                    }
+                }
+                throw LocalAIError("Antigravity could not finish after retrying. Your source text is kept.")
+            }
+            let data = try LocalProcess.run(settings.executable!, arguments: settings.arguments(effort: effort), input: input, directory: scratch, timeout: timeout, environment: environment, cancellation: cancellation)
             guard let text = String(data: data, encoding: .utf8), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw LocalAIError("\(settings.provider.title) returned no text. Check its login and model.") }
             return text
         }
         let request = try request(settings: settings, prompt: prompt, key: AIKeychain.read(for: settings.serverURL()), timeout: timeout)
-        return try send(request, timeout: timeout)
+        return try send(request, timeout: timeout, cancellation: cancellation)
     }
     public static func antigravityResponse(_ data: Data) throws -> String {
         let records = data.split(separator: 10).compactMap { try? JSONSerialization.jsonObject(with: Data($0)) as? [String: Any] }
@@ -186,7 +204,7 @@ public enum AIClient {
             case "WAITING":
                 throw LocalAIError("Antigravity stopped while waiting for input or permission. Try again with a question it can answer from the supplied text.")
             default:
-                throw LocalAIError("Antigravity could not complete this answer. Please try again; if it keeps failing, check the connection and selected model in AI settings.")
+                throw antigravityFailure(result["error"])
             }
         }
         guard let answer = result["response"] as? String, !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -194,7 +212,34 @@ public enum AIClient {
         }
         return answer
     }
-    public static func send(_ request: URLRequest, timeout: TimeInterval) throws -> String {
+    static func hasAntigravityResult(_ data:Data)->Bool {
+        data.split(separator:10).contains{line in
+            (try? JSONSerialization.jsonObject(with:Data(line)) as? [String:Any])?["event"] as? String == "result"
+        }
+    }
+    private static func antigravityFailure(_ value:Any?)->LocalAIError {
+        let message=(value as? String ?? "").lowercased()
+        if message.contains("no capacity") || message.contains("overloaded") || message.contains("503") || message.contains("unavailable") {
+            return LocalAIError("Antigravity's selected model is temporarily unavailable (server capacity). Retry later or choose another model in AI settings. Your transcript and notes are kept.",retryable:true)
+        }
+        if message.contains("quota") || message.contains("resource_exhausted") || message.contains("rate limit") || message.contains("429") {
+            return LocalAIError("Antigravity reports a usage or rate limit. Wait for it to reset or choose another available model in AI settings. Your transcript and notes are kept.")
+        }
+        if message.contains("not recognized") || message.contains("invalid model") || message.contains("model not found") {
+            return LocalAIError("Antigravity does not recognize the selected model. Refresh the model list in AI settings and choose an available model.")
+        }
+        if message.contains("unauthenticated") || message.contains("authentication") || message.contains("not logged in") {
+            return LocalAIError("Antigravity needs a valid login. Use Sign in in AI settings, then retry. Your transcript and notes are kept.")
+        }
+        if message.contains("timeout") || message.contains("timed out") || message.contains("deadline") {
+            return LocalAIError("Antigravity took too long to finish this section. Retry or choose a faster model. Your transcript and notes are kept.",retryable:true)
+        }
+        if message.contains("context length") || message.contains("too many tokens") || message.contains("token limit") {
+            return LocalAIError("Antigravity could not fit this section in the selected model's context. Choose a model with a larger context. Your transcript and notes are kept.")
+        }
+        return LocalAIError("Antigravity returned an incomplete or failed answer. Check connection and model in AI settings. Your transcript and notes are kept.")
+    }
+    public static func send(_ request: URLRequest, timeout: TimeInterval, cancellation: AICancellation? = nil) throws -> String {
         let done = DispatchSemaphore(value: 0), result = HTTPResult()
         let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
@@ -203,7 +248,12 @@ public enum AIClient {
             done.signal()
         }
         task.resume()
-        guard done.wait(timeout: .now() + timeout + 1) == .success else { task.cancel(); throw LocalAIError("The AI server timed out.") }
+        let deadline = Date().addingTimeInterval(timeout + 1)
+        while done.wait(timeout: .now() + 0.1) != .success {
+            if cancellation?.isCancelled == true { task.cancel(); throw CancellationError() }
+            if Date() >= deadline { task.cancel(); throw LocalAIError("The AI server timed out.") }
+        }
+        try cancellation?.check()
         if let error = result.error { throw error }
         return try response(result.data ?? Data(), status: result.status)
     }

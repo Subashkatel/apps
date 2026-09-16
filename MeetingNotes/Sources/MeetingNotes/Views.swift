@@ -17,9 +17,12 @@ enum Palette {
 }
 struct MeetingRoot: View {
     @ObservedObject var store: MeetingStore
+    @ObservedObject var discussion: DiscussionStore
+    init(store:MeetingStore){self.store=store;self.discussion=store.discussion}
     @State private var projectName=""
     @State private var addingProject=false
     @State private var showTrash=false
+    @State private var calendarDraft:CalendarDraft?
     var body: some View {
         VStack(spacing:0) {
             HStack(spacing:12) {
@@ -46,10 +49,8 @@ struct MeetingRoot: View {
             Divider()
             HStack(spacing:0) {
                 if store.sidebar {sidebar.frame(width:220);Divider()}
-                if let m=store.current {MeetingDocument(store:store,id:m.id).id(m.id)}
-                else if let p=store.currentProject {ProjectDocument(store:store,project:p).id(p.id)}
-                else if store.selection == "tasks" {ProjectDocument(store:store,project:nil)}
-                else {empty.frame(maxWidth:.infinity,maxHeight:.infinity)}
+                if store.current==nil && store.currentProject==nil && store.selection != "tasks" && !discussion.isOpen {empty.frame(maxWidth:.infinity,maxHeight:.infinity)}
+                else {DiscussionWorkspace(store:store,discussion:discussion)}
             }
             if store.unsavedCount>0 {
                 HStack{Text("Some edits are not saved.").foregroundStyle(.orange);Button("Retry saving"){store.flush()};Spacer()}.padding(12)
@@ -57,9 +58,13 @@ struct MeetingRoot: View {
             if !store.status.isEmpty {Text(store.status).font(.caption).foregroundStyle(Palette.secondary).frame(maxWidth:.infinity,alignment:.leading).padding(.horizontal,20).padding(.vertical,6)}
         }.background(Palette.background).foregroundStyle(Palette.ink).tint(Palette.accent)
         .preferredColorScheme(store.preferences.appearance == "light" ? .light:.dark)
-        .frame(minWidth:780,minHeight:560)
+        .frame(minWidth:discussion.isOpen && store.sidebar ? 1020:780,minHeight:560)
         .sheet(isPresented:$store.settingsOpen){MeetingSettings(store:store)}
+        .sheet(isPresented:Binding(get:{store.pendingSummaryID != nil},set:{if !$0{store.pendingSummaryID=nil}})) {
+            if let id=store.pendingSummaryID { SummaryProjectChoice(store:store,meetingID:id) }
+        }
         .sheet(isPresented:$showTrash){TrashView(store:store)}
+        .sheet(item:$calendarDraft){CalendarSheet(draft:$0,store:store)}
         .confirmationDialog("Move meeting to Trash?",isPresented:Binding(get:{store.pendingDeleteMeeting != nil},set:{if !$0{store.pendingDeleteMeeting=nil}}),titleVisibility:.visible){
             if let id=store.pendingDeleteMeeting {
                 let count=store.meetingTasks(id).count
@@ -81,7 +86,7 @@ struct MeetingRoot: View {
                 Text("Meetings").font(.caption).foregroundStyle(Palette.secondary).padding(.horizontal,10).padding(.bottom,6)
                 ForEach(store.meetings.filter{$0.deletedAt==nil}){m in
                     Button{store.select(m.id)} label:{VStack(alignment:.leading,spacing:4){Text(m.title).font(.system(size:13,weight:.medium)).lineLimit(2);Text(m.draft?.applied == true ? m.created.formatted(date:.abbreviated,time:.omitted) : m.phase.title).font(.caption).foregroundStyle(Palette.secondary)}.frame(maxWidth:.infinity,alignment:.leading).padding(10).background(store.selection==m.id ? Palette.panel:Color.clear).clipShape(RoundedRectangle(cornerRadius:6))}.buttonStyle(.plain)
-                    .contextMenu{Button("Export note & transcript…"){store.export(m)};Button("Show audio files"){store.reveal(m.id)};Button("Move to Trash…",role:.destructive){store.pendingDeleteMeeting=m.id}}
+                    .contextMenu{Button("Add to calendar…"){calendarDraft=CalendarDraft.meeting(m,project:store.projects.first{$0.id==m.projectID}?.name)};Divider();Button("Export note & transcript…"){store.export(m)};Button("Show audio files"){store.reveal(m.id)};Button("Move to Trash…",role:.destructive){store.pendingDeleteMeeting=m.id}}
                 }
                 HStack{Text("Projects").font(.caption).foregroundStyle(Palette.secondary);Spacer();Button{addingProject=true}label:{Image(systemName:"plus")}.buttonStyle(.plain).help("Add project")}.padding(.horizontal,10).padding(.top,26)
                 ForEach(store.projects){p in Button{store.select("project:"+p.id)}label:{Text(p.name).font(.system(size:13,weight:.medium)).frame(maxWidth:.infinity,alignment:.leading).padding(10).background(store.selection == "project:"+p.id ? Palette.panel:Color.clear).clipShape(RoundedRectangle(cornerRadius:6))}.buttonStyle(.plain)}
@@ -99,6 +104,7 @@ struct MeetingRoot: View {
 struct MeetingDocument: View {
     @ObservedObject var store: MeetingStore
     let id: String
+    @State private var calendarDraft:CalendarDraft?
     @State private var reviewTasks=false
     @State private var originals=false
     @State private var confirmRegenerate=false
@@ -107,6 +113,7 @@ struct MeetingDocument: View {
     @State private var projectName=""
     @State private var showDecision=false
     @State private var showQuestion=false
+    @State private var showTopics=false
     private var meeting: Meeting?{store.meetings.first{$0.id==id}}
     private func text(_ key:WritableKeyPath<Meeting,String>)->Binding<String>{Binding(get:{meeting?[keyPath:key] ?? ""},set:{value in store.update(id){$0[keyPath:key]=value}})}
     private func draftText(_ key:WritableKeyPath<MeetingDraft,String>)->Binding<String>{Binding(get:{meeting?.draft?[keyPath:key] ?? ""},set:{value in store.update(id){$0.draft?[keyPath:key]=value}})}
@@ -116,7 +123,18 @@ struct MeetingDocument: View {
                 if let m=meeting {
                     VStack(alignment:.leading,spacing:22) {
                         title(m)
-                        if let problem=m.error {Text(problem).foregroundStyle(.orange).font(.callout).textSelection(.enabled)}
+                        if let problem=m.error {
+                            VStack(alignment:.leading,spacing:8){
+                                Text(problem).foregroundStyle(.orange).font(.callout).textSelection(.enabled)
+                                HStack{
+                                    Button("AI & transcription settings…"){store.settingsOpen=true}
+                                    if store.activeID != id,store.transcriptionProgress[id] == nil,!store.drafting.contains(id){
+                                        if m.transcript.isEmpty || m.phase == .failed || m.phase == .interrupted{Button("Retry transcription"){store.transcribe(id)}}
+                                        if !m.transcript.isEmpty{Button("Retry summary"){Task{await store.summarize(id)}}}
+                                    }
+                                }.font(.caption).buttonStyle(.plain).foregroundStyle(Palette.accent)
+                            }
+                        }
                         if store.activeID==id {live(m)}
                         else if let progress=store.transcriptionProgress[id] {HStack{ProgressView().controlSize(.small);Text(progress).foregroundStyle(Palette.secondary)};roughNotes;audioActions(m)}
                         else if let draft=m.draft {draftView(m,draft)}
@@ -130,6 +148,7 @@ struct MeetingDocument: View {
             }
             if store.transcriptOpen,let m=meeting {Divider();TranscriptPanel(store:store,meeting:m).frame(minWidth:260,idealWidth:330,maxWidth:400)}
         }
+        .sheet(item:$calendarDraft){CalendarSheet(draft:$0,store:store)}
         .sheet(isPresented:$addingTask){TaskEditor(store:store,task:WorkTask(projectID:meeting?.projectID,title:"",owner:"Me",meetingID:id))}
         .alert("New project",isPresented:$addingProject){TextField("Project name",text:$projectName);Button("Create"){store.addProject(projectName);if let p=store.projects.first(where:{$0.name.caseInsensitiveCompare(projectName.trimmingCharacters(in:.whitespacesAndNewlines)) == .orderedSame}){store.assignProject(id,project:p.id);store.select(id)};projectName=""};Button("Cancel",role:.cancel){}}
         .confirmationDialog("Replace the AI draft? Your original notes and audio are kept.",isPresented:$confirmRegenerate){Button("Generate a new draft"){Task{await store.summarize(id)}}}
@@ -142,14 +161,15 @@ struct MeetingDocument: View {
                 HStack(spacing:8){
                     Text("Project").font(.caption).foregroundStyle(Palette.secondary)
                     Menu {
-                        Button("Unfiled"){store.assignProject(id,project:nil)}
+                        Button("Standalone"){store.assignProject(id,project:nil)}
                         ForEach(store.projects){p in Button(p.name){store.assignProject(id,project:p.id)}}
                         Divider();Button("New project…"){addingProject=true}
-                    } label:{HStack(spacing:8){Text(store.projects.first{$0.id==m.projectID}?.name ?? "Unfiled").lineLimit(1);Image(systemName:"chevron.down").font(.system(size:9))}.foregroundStyle(Palette.ink).padding(.horizontal,10).padding(.vertical,6).background(Palette.panel).clipShape(RoundedRectangle(cornerRadius:5))}
+                    } label:{HStack(spacing:8){Text(store.projects.first{$0.id==m.projectID}?.name ?? "Standalone").lineLimit(1);Image(systemName:"chevron.down").font(.system(size:9))}.foregroundStyle(Palette.ink).padding(.horizontal,10).padding(.vertical,6).background(Palette.panel).clipShape(RoundedRectangle(cornerRadius:5))}
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize(horizontal:false,vertical:true).disabled(store.drafting.contains(id))
                 }.frame(maxWidth:280,alignment:.leading)
                 Spacer()
-                Menu{Button("Export note & transcript…"){store.export(m)};Button("Show audio files"){store.reveal(id)};Button("Move to Trash…",role:.destructive){store.pendingDeleteMeeting=id}.disabled(store.activeID==id || store.transcriptionProgress[id] != nil || store.drafting.contains(id))}label:{Image(systemName:"ellipsis")}.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width:32)
+                DiscussButton(store:store,discussion:store.discussion,meeting:m)
+                Menu{Button("Add to calendar…"){calendarDraft=CalendarDraft.meeting(m,project:store.projects.first{$0.id==m.projectID}?.name)};Divider();Button("Export note & transcript…"){store.export(m)};Button("Show audio files"){store.reveal(id)};Button("Move to Trash…",role:.destructive){store.pendingDeleteMeeting=id}.disabled(store.activeID==id || store.transcriptionProgress[id] != nil || store.drafting.contains(id))}label:{Image(systemName:"ellipsis")}.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width:32)
             }
         }
     }
@@ -179,7 +199,8 @@ struct MeetingDocument: View {
             HStack(alignment:.top){VStack(alignment:.leading,spacing:9){
                 if m.transcript.isEmpty {Button("Transcribe recording"){store.transcribe(id)}.buttonStyle(.borderedProminent)}
                 else {Button(store.drafting.contains(id) ? "Summarizing…" : "Summarize & find tasks"){Task{await store.summarize(id)}}.buttonStyle(.borderedProminent).disabled(store.drafting.contains(id))}
-                Button(store.preferences.ai.selectionLabel+" ⌄"){store.settingsOpen=true}.font(.caption).buttonStyle(.plain).foregroundStyle(Palette.secondary)
+                Button("AI settings · "+store.preferences.ai.selectionLabel+" ⌄"){store.settingsOpen=true}.font(.caption).buttonStyle(.plain).foregroundStyle(Palette.secondary)
+                if let progress=store.summaryProgress[id]{Text(progress).font(.caption).foregroundStyle(Palette.secondary)}
             };Spacer();if store.drafting.contains(id){ProgressView().controlSize(.small)}else{Text("Your original notes are kept.").font(.caption).foregroundStyle(Palette.secondary)}}
         }
     }
@@ -191,7 +212,7 @@ struct MeetingDocument: View {
             if m.projectID != nil {
                 DisclosureGroup(m.draft?.contextMeetingIDs == nil ? "Project context for next summary · \(context.entries.count) meetings":"Project context used · \(ids.count) meetings") {
                     VStack(alignment:.leading,spacing:8){
-                        Text("Saved summaries, decisions, open questions, personal notes and current open tasks. Earlier full transcripts and attachment contents are not included.")
+                        Text("Project notes, saved summaries, decisions, open questions, personal notes and current open tasks. Earlier full transcripts and attachment contents are not included.")
                         if omitted>0{Text("\(omitted) meetings exceed the context limit and are excluded. Recent meetings take priority.").foregroundStyle(.orange)}
                         ForEach(ids,id:\.self){id in if let previous=store.meetings.first(where:{$0.id==id}){Button(previous.title+(previous.deletedAt != nil ? " · in Trash":"")){store.select(id)}.buttonStyle(.plain).disabled(previous.deletedAt != nil)}}
                     }.padding(.top,8)
@@ -203,10 +224,33 @@ struct MeetingDocument: View {
         VStack(alignment:.leading,spacing:22){
             HStack{Button("\(d.applied ? "Saved" : "Draft") · \(d.provider) · \(d.model) ⌄"){store.settingsOpen=true}.font(.caption).buttonStyle(.plain).foregroundStyle(Palette.secondary);Spacer();Button("Transcript ↗"){store.transcriptOpen.toggle()}.font(.caption).buttonStyle(.plain)}
             projectContext(m)
-            EditablePassage(title:nil,text:draftText(\.summary),height:100)
+            if let progress=store.summaryProgress[id]{Text(progress).font(.caption).foregroundStyle(Palette.secondary)}
+            if !(d.topics ?? "").isEmpty || showTopics {
+                DiscussionSummary(text:Binding(get:{meeting?.draft?.topics ?? ""},set:{value in store.update(id){$0.draft?.topics=value}}))
+            }
+            if let issues=d.reviewIssues,!issues.isEmpty {ForEach(issues,id:\.self){Text($0).font(.caption).foregroundStyle(Palette.secondary)}}
+            if let deferred=d.deferredTasks,!deferred.isEmpty {
+                DisclosureGroup("\(deferred.count) \(deferred.count == 1 ? "task suggestion needs" : "task suggestions need") checking") {
+                    VStack(alignment:.leading,spacing:12) {
+                        Text("Your summary is kept. These suggestions will not change any tasks.").font(.caption).foregroundStyle(Palette.secondary)
+                        ForEach(Array(deferred.enumerated()),id:\.offset){_,item in
+                            VStack(alignment:.leading,spacing:4){
+                                Text(item.title).textSelection(.enabled)
+                                Text(item.reason).font(.caption).foregroundStyle(Palette.secondary)
+                                if let suggestion=try? JSONDecoder().decode(DraftResponse.Change.self,from:Data(item.response.utf8)) {
+                                    Text([suggestion.owner,suggestion.due,suggestion.dueTime].compactMap{$0}.filter{!$0.isEmpty}.joined(separator:" · ")).font(.caption).foregroundStyle(Palette.secondary)
+                                    if let source=suggestion.evidence.first(where:{evidence in m.transcript.contains{$0.id==evidence}}){Button("View source passage"){store.sourceSegment=source;store.transcriptOpen=true}.font(.caption).buttonStyle(.plain).foregroundStyle(Palette.accent)}
+                                }
+                            }
+                        }
+                        HStack{Button("View transcript"){store.transcriptOpen=true};Button("Add task manually"){addingTask=true}}.buttonStyle(.plain).foregroundStyle(Palette.accent)
+                    }.padding(.top,8)
+                }
+            }
+            EditablePassage(title:"Detailed summary",text:draftText(\.summary),height:100)
             if !d.decision.isEmpty || showDecision {EditablePassage(title:"Decided",text:draftText(\.decision),height:65).help("Agreements and conclusions reached in this meeting")}
             if !d.question.isEmpty || showQuestion {EditablePassage(title:"Still open",text:draftText(\.question),height:65).help("Unresolved questions to return to")}
-            if d.decision.isEmpty || d.question.isEmpty {Menu("Add section"){if d.decision.isEmpty{Button("Decided"){showDecision=true}};if d.question.isEmpty{Button("Still open"){showQuestion=true}}}.menuStyle(.borderlessButton).fixedSize().font(.caption)}
+            if (d.topics ?? "").isEmpty || d.decision.isEmpty || d.question.isEmpty {Menu("Add section"){if (d.topics ?? "").isEmpty{Button("What we talked about"){showTopics=true}};if d.decision.isEmpty{Button("Decided"){showDecision=true}};if d.question.isEmpty{Button("Still open"){showQuestion=true}}}.menuStyle(.borderlessButton).fixedSize().font(.caption)}
             if !d.evidence.isEmpty {Button("Check source passages ↗"){store.sourceSegment=d.evidence.first;store.transcriptOpen=true}.font(.caption).buttonStyle(.plain)}
             if !d.applied,!d.changes.isEmpty {
                 Divider()
@@ -234,6 +278,21 @@ struct MeetingDocument: View {
         }
     }
 }
+struct DiscussionSummary: View {
+    @Binding var text:String
+    @AppStorage("meetingDiscussionExpanded") private var expanded=true
+    @State private var editing=false
+    var body:some View {
+        DisclosureGroup(isExpanded:$expanded){
+            VStack(alignment:.leading,spacing:10){
+                if editing {NoteEditor(text:$text,minimumHeight:60,label:"What we talked about")}
+                else {MarkdownNotes(text:text).frame(maxWidth:.infinity,alignment:.leading)}
+                HStack{Spacer();Button(editing ? "Done editing":"Edit"){editing.toggle()}.buttonStyle(.plain).font(.caption).foregroundStyle(Palette.secondary).accessibilityLabel(editing ? "Finish editing discussion":"Edit what we talked about")}
+            }.padding(.top,10)
+        } label:{Text("What we talked about").font(.system(size:13,weight:.medium))}
+        .tint(Palette.secondary)
+    }
+}
 struct EditablePassage: View {
     let title:String?
     @Binding var text:String
@@ -257,8 +316,8 @@ struct TaskProposal: View {
 struct TranscriptPanel:View {
     @ObservedObject var store:MeetingStore
     let meeting:Meeting
-    private var segments:[Segment]{store.sourceSegment == nil ? meeting.transcript : meeting.draft?.sourceTranscript ?? meeting.transcript}
-    var body:some View {VStack(alignment:.leading,spacing:12){HStack{Text("Transcript").fontWeight(.medium);Spacer();Button{store.transcriptOpen=false}label:{Image(systemName:"xmark")}.buttonStyle(.plain).help("Close transcript")};Text("Audio tracks, not verified speakers. Click a timestamp to listen.").font(.caption).foregroundStyle(Palette.secondary)
+    private var segments:[Segment]{store.sourceSegment == nil || store.transcriptUsesCurrentVersion ? meeting.transcript : meeting.draft?.sourceTranscript ?? meeting.transcript}
+    var body:some View {VStack(alignment:.leading,spacing:12){HStack{Text("Transcript").fontWeight(.medium);Spacer();Button{store.transcriptOpen=false;store.sourceSegment=nil;store.transcriptUsesCurrentVersion=false}label:{Image(systemName:"xmark")}.buttonStyle(.plain).help("Close transcript")};Text("Audio tracks, not verified speakers. Click a timestamp to listen.").font(.caption).foregroundStyle(Palette.secondary)
         ScrollViewReader{proxy in ScrollView{LazyVStack(alignment:.leading,spacing:20){ForEach(segments){s in VStack(alignment:.leading,spacing:6){HStack{Button(s.time){store.play(meeting,segment:s)}.buttonStyle(.plain).foregroundStyle(Palette.accent);Text(s.speaker).foregroundStyle(Palette.secondary)}.font(.caption);Text(s.text).font(.system(size:13)).textSelection(.enabled)}.padding(10).frame(maxWidth:.infinity,alignment:.leading).background(store.sourceSegment==s.id ? Palette.panel:Color.clear).id(s.id)}}.onAppear{if let id=store.sourceSegment{proxy.scrollTo(id,anchor:.center)}}.onChange(of:store.sourceSegment){_,id in if let id{proxy.scrollTo(id,anchor:.center)}}}
         }
         if store.playingID==meeting.id{Button("Stop playback"){store.stopPlayback()}}
@@ -278,13 +337,8 @@ struct ProjectDocument:View {
     }
     var body:some View{ScrollView{VStack(alignment:.leading,spacing:22){
         HStack{Text(project?.name ?? "Tasks").font(.custom("Georgia",size:29));Spacer();Button("Add task"){addingTask=true}.buttonStyle(.borderedProminent)}
-        TextField("Search tasks or owners",text:$query.search).textFieldStyle(.roundedBorder)
-        ViewThatFits(in:.horizontal){HStack{filters};VStack(alignment:.leading){filters}}
-        HStack{
-            Picker("Due",selection:$query.deadline){Text("Any date").tag("all");Text("Today").tag("today");Text("Overdue").tag("overdue");Text("No date").tag("none")}
-            Picker("Sort",selection:$query.sort){Text("Due date").tag("due");Text("Newest").tag("newest");Text("Title").tag("title")}
-            Picker("Group",selection:$grouping){Text("None").tag("none");Text("Project").tag("project");Text("Meeting").tag("meeting");Text("Due date").tag("due")}
-        }.font(.caption)
+        if let project {ProjectNotesEditor(store:store,project:project)}
+        TaskFilterBar(store:store,project:project,query:$query,grouping:$grouping,count:visible.count)
         if visible.isEmpty{Text("No tasks match these filters.").foregroundStyle(Palette.secondary).padding(.vertical,16)}
         if grouping=="none"{ForEach(visible){task in TaskRow(store:store,task:task);Divider()}}
         else {ForEach(Array(Set(visible.map{group($0)})).sorted(),id:\.self){key in
@@ -297,11 +351,7 @@ struct ProjectDocument:View {
             ForEach(store.meetings.filter{$0.projectID==project.id && $0.deletedAt==nil}){m in Button{store.select(m.id)}label:{VStack(alignment:.leading,spacing:5){Text(m.title);Text(m.created.formatted(date:.abbreviated,time:.shortened)).font(.caption).foregroundStyle(Palette.secondary)}}.buttonStyle(.plain)}
         }
     }.padding(32).frame(maxWidth:900,alignment:.leading).frame(maxWidth:.infinity,alignment:.leading)}.sheet(isPresented:$addingTask){TaskEditor(store:store,task:WorkTask(projectID:project?.id,title:"",owner:"Me"))}}
-    @ViewBuilder private var filters:some View {
-        if project==nil{Picker("Project",selection:$query.project){Text("All projects").tag("all");Text("Unfiled").tag("unfiled");ForEach(store.projects){Text($0.name).tag($0.id)}}}
-        Picker("Meeting",selection:$query.meeting){Text("All meetings").tag("all");Text("No meeting").tag("none");ForEach(store.meetings.filter{project==nil || $0.projectID==project?.id}){Text($0.title+($0.deletedAt != nil ? " · in Trash":"")).tag($0.id)}}
-        Picker("Status",selection:$query.status){Text("Open").tag("open");Text("Completed").tag("done");Text("All").tag("all")}
-    }
+
 }
 struct TrashView:View {
     @ObservedObject var store:MeetingStore
@@ -315,5 +365,55 @@ struct TrashView:View {
                 Section("Tasks") {ForEach(store.tasks.filter{$0.deletedAt != nil}){t in HStack{VStack(alignment:.leading){Text(t.title);if t.deletedWithMeetingID != nil{Text("Deleted with its meeting").font(.caption).foregroundStyle(.secondary)}};Spacer();Button("Restore task"){store.restoreTask(t.id)}}}}
             }
         }.padding(24).frame(width:640,height:440).background(Palette.background).foregroundStyle(Palette.ink).tint(Palette.accent)
+    }
+}
+
+struct SummaryProjectChoice:View {
+    @ObservedObject var store:MeetingStore
+    let meetingID:String
+    @State private var choice="standalone"
+    @State private var name=""
+    @State private var problem:String?
+    var body:some View {
+        VStack(alignment:.leading,spacing:18){
+            Text("Where does this meeting belong?").font(.custom("Georgia",size:25))
+            Text("Keep it standalone, or use a project's notes, earlier meetings and open tasks as context. You can change this later.").font(.callout).foregroundStyle(Palette.secondary)
+            Picker("Save in",selection:$choice){Text("Standalone meeting").tag("standalone");ForEach(store.projects){Text($0.name).tag($0.id)};Text("New project…").tag("new")}
+            if choice=="new"{TextField("Project name",text:$name).textFieldStyle(.roundedBorder)}
+            if let problem{Text(problem).foregroundStyle(.orange).font(.caption)}
+            HStack{Button("Cancel"){store.pendingSummaryID=nil}.keyboardShortcut(.cancelAction);Spacer();Button("Continue to summary"){
+                var project:String?=choice=="standalone" ? nil:choice
+                if choice=="new" {
+                    let trimmed=name.trimmingCharacters(in:.whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else{return}
+                    if store.projects.contains(where:{$0.name.caseInsensitiveCompare(trimmed) == .orderedSame}){problem="This project already exists. Choose it from the list.";return}
+                    store.addProject(trimmed)
+                    guard let created=store.projects.first(where:{$0.name==trimmed}) else{problem="The project could not be saved.";return}
+                    project=created.id
+                }
+                store.assignProject(meetingID,project:project)
+                guard let meeting=store.meetings.first(where:{$0.id==meetingID}),!store.needsProjectChoice(meeting),meeting.projectID==project else{problem="Your choice could not be saved. Please try again.";return}
+                store.pendingSummaryID=nil;store.select(meetingID)
+                let taskRecovery=store.pendingTaskRecovery;store.pendingTaskRecovery=false
+                Task{if taskRecovery{await store.findTasks(meetingID)}else{await store.summarize(meetingID)}}
+            }.buttonStyle(.borderedProminent).disabled(choice=="new" && name.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty).keyboardShortcut(.defaultAction)}
+        }.padding(28).frame(width:480).background(Palette.background).foregroundStyle(Palette.ink).tint(Palette.accent)
+    }
+}
+struct ProjectNotesEditor:View {
+    @ObservedObject var store:MeetingStore
+    let project:MeetingProject
+    @State private var editing=false
+    @State private var text=""
+    var body:some View {
+        VStack(alignment:.leading,spacing:10){
+            HStack{Text("Project notes").fontWeight(.medium);Spacer();if !editing{Button((project.notes ?? "").isEmpty ? "Add notes":"Edit"){text=project.notes ?? "";editing=true}.buttonStyle(.plain).foregroundStyle(Palette.accent)}}
+            if editing{
+                FormattedNotes(text:$text)
+                HStack{Text("Background for future summaries, not new task evidence.").font(.caption).foregroundStyle(Palette.secondary);Spacer();Button("Cancel"){editing=false};Button("Save notes"){if store.saveProjectNotes(project.id,notes:text){editing=false}}.buttonStyle(.borderedProminent)}
+            }else if let notes=project.notes,!notes.isEmpty{Text(.init(notes)).textSelection(.enabled)}
+            else{Text("What is this project about? Add its purpose, goals and useful context.").font(.callout).foregroundStyle(Palette.secondary)}
+            Divider()
+        }
     }
 }

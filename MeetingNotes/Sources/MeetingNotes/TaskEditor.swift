@@ -35,6 +35,7 @@ struct TaskRow:View {
     @ObservedObject var store:MeetingStore
     let task:WorkTask
     @State private var editing=false
+    @State private var calendarDraft:CalendarDraft?
     var body:some View{
         HStack(alignment:.top,spacing:10){
             Toggle("Complete task",isOn:Binding(get:{task.done},set:{_ in store.toggleTask(task.id)})).labelsHidden().toggleStyle(.checkbox)
@@ -44,9 +45,10 @@ struct TaskRow:View {
                 if let id=task.meetingID,store.meetings.contains(where:{$0.id==id && $0.deletedAt != nil}){Text("Source meeting in Trash").font(.caption).foregroundStyle(Palette.secondary)}
             }
             Spacer()
-            Menu{Button("Edit task…"){editing=true};if let id=task.meetingID {
+            Menu{Button("Edit task…"){editing=true};Button("Add to calendar…"){calendarDraft=CalendarDraft.task(task,project:store.projects.first{$0.id==task.projectID}?.name)};if let id=task.meetingID {
                 if store.meetings.contains(where:{$0.id==id && $0.deletedAt==nil}){Button("Open source meeting"){store.select(id)}}else{Text("Source meeting is in Trash")}
             };Divider();Button("Delete task",role:.destructive){store.deleteTask(task.id)}}label:{Image(systemName:"ellipsis")}.menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width:32)
         }.sheet(isPresented:$editing){TaskEditor(store:store,task:task)}
+        .sheet(item:$calendarDraft){CalendarSheet(draft:$0,store:store)}
     }
 }

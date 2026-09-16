@@ -2,8 +2,19 @@ import Foundation
 
 public struct LocalAIError: LocalizedError {
     var message: String
+    public var retryable: Bool
     public var errorDescription: String? { message }
-    public init(_ message: String) { self.message = message }
+    public init(_ message: String, retryable: Bool = false) { self.message = message; self.retryable = retryable }
+}
+
+/// Cancellation belongs to one request, never to other apps or summary jobs.
+public final class AICancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopped = false
+    public init() {}
+    public func cancel() { lock.lock(); stopped = true; lock.unlock() }
+    public var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+    public func check() throws { if isCancelled { throw CancellationError() } }
 }
 
 /// Bounded, concurrent pipe draining prevents a long book or CLI error from deadlocking.
@@ -22,7 +33,8 @@ public enum LocalProcess {
     }
 
     public static func run(_ executable: URL, arguments: [String], input: Data = Data(),
-                    directory: URL? = nil, timeout: TimeInterval = 30, limit: Int = 20_000_000, environment: [String: String]? = nil) throws -> Data {
+                    directory: URL? = nil, timeout: TimeInterval = 30, limit: Int = 20_000_000, environment: [String: String]? = nil, cancellation: AICancellation? = nil) throws -> Data {
+        try cancellation?.check()
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -44,7 +56,7 @@ public enum LocalProcess {
             try? stdin.fileHandleForWriting.close()
         }
         let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline && !out.overflow && !err.overflow { Thread.sleep(forTimeInterval: 0.02) }
+        while process.isRunning && Date() < deadline && !out.overflow && !err.overflow && cancellation?.isCancelled != true { Thread.sleep(forTimeInterval: 0.02) }
         let interrupted = process.isRunning
         if interrupted {
             process.terminate()
@@ -54,9 +66,14 @@ public enum LocalProcess {
         }
         process.waitUntilExit()
         _ = group.wait(timeout: .now() + 2)
+        try cancellation?.check()
         if out.overflow || err.overflow { throw LocalAIError("The document or response exceeds the supported size.") }
         if interrupted { throw LocalAIError("The operation timed out. Try a smaller document or check your AI connection.") }
         guard process.terminationStatus == 0 else {
+            if executable.lastPathComponent == "agy", AIClient.hasAntigravityResult(out.value) {
+                // Preserve structured provider errors even when the CLI exits nonzero.
+                _ = try AIClient.antigravityResponse(out.value)
+            }
             let failure = (String(data: out.value, encoding: .utf8) ?? "") + (String(data: err.value, encoding: .utf8) ?? "")
             let message = failure.lowercased()
             if ["claude", "codex", "gemini", "agy"].contains(executable.lastPathComponent) {

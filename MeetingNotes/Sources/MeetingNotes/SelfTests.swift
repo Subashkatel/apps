@@ -5,6 +5,10 @@ import LocalSupport
 @MainActor enum SelfTests {
     static func require(_ condition:@autoclosure()->Bool,_ message:String)throws{if !condition(){throw MeetingError(message)}}
     static func run() throws {
+        try require(!AppLaunchMode.isPreview(bundleID:"local.meetingnotes",arguments:[]),"Installed app incorrectly treated as a preview")
+        try require(AppLaunchMode.isPreview(bundleID:"local.meetingnotes.filtersqa",arguments:[]),"Reopening a test bundle could access real data")
+        try require(AppLaunchMode.isPreview(bundleID:"local.meetingnotes",arguments:["--ui-inspect"]),"Explicit UI test mode lost isolation")
+        try CalendarTests.run()
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("meetingnotes-check-"+UUID().uuidString)
         defer{try? FileManager.default.removeItem(at:root)}
         let db=try Database(root:root)
@@ -46,7 +50,23 @@ import LocalSupport
         let json="""
         {"summary":"We discussed timing.","decision":"Compare two datasets.","question":"Do bursts matter?","evidence":["seg1"],"changes":[{"existingID":null,"title":"Check assumptions","owner":"Morgan","due":null,"evidence":["seg2"]}],"relatedMeetingID":null,"relatedReason":null}
         """
-        _=try Summarizer.decode(json,meeting:m,tasks:[t],related:[],config:AISettings())
+        let legacyDraft=try Summarizer.decode(json,meeting:m,tasks:[t],related:[],config:AISettings())
+        try require(legacyDraft.topics == nil && legacyDraft.summary == "We discussed timing.","Legacy summary was changed when no topics were supplied")
+        let legacyData=try JSONEncoder().encode(legacyDraft)
+        let legacyReload=try JSONDecoder().decode(MeetingDraft.self,from:legacyData)
+        try require(legacyReload == legacyDraft,"An older draft without topics no longer loads")
+        var topicResponse=try JSONSerialization.jsonObject(with:Data(json.utf8)) as! [String:Any]
+        let topicText="- Timing assumptions\n- Bursty arrivals"
+        topicResponse["topics"]=topicText
+        let topicDraft=try Summarizer.decode(String(decoding:try JSONSerialization.data(withJSONObject:topicResponse),as:UTF8.self),meeting:m,tasks:[t],related:[],config:AISettings())
+        var topicMeeting=m;topicMeeting.draft=topicDraft
+        let topicDB=try Database(root:root.appendingPathComponent("topic-check"))
+        try topicDB.put(topicMeeting,kind:"meeting",id:topicMeeting.id)
+        let topicReload=try topicDB.list(Meeting.self,kind:"meeting")[0]
+        try require(topicReload.draft?.topics == topicText && topicReload.draft?.summary == legacyDraft.summary,"Topics and detailed summary did not persist independently")
+        let exported=MeetingStore.markdown(topicReload)
+        try require(exported.contains("## What we talked about\n"+topicText) && exported.contains("## Detailed summary\n"+legacyDraft.summary),"Export dropped the topics or detailed summary")
+        print("PASS older summaries preserved and separate topics/detail survive persistence and export")
         let unfiledDraft=try Summarizer.decode(json,meeting:unfiled,tasks:[],related:[],config:AISettings())
         try require(unfiledDraft.changes.count==1,"Unfiled task suggestions were discarded")
         let titledJSON=json.replacingOccurrences(of:"\"summary\":",with:"\"title\":\"Research timing\",\"summary\":").replacingOccurrences(of:"\"due\":null",with:"\"due\":\"2026-09-20\",\"dueTime\":\"16:30\"")
@@ -64,6 +84,7 @@ import LocalSupport
         try require(automatic.title=="My own title","Manual title was overwritten")
         let managementRoot=root.appendingPathComponent("management")
         let management=try MeetingStore(root:managementRoot,recover:false)
+        try require(!management.isMonitoringCapture,"Idle app is running the recording animation timer")
         management.addProject("Research")
         let projectID=management.projects[0].id
         var personal=WorkTask(title:"Write comparison",owner:"Me",due:"2026-09-20",dueTime:"16:30",meetingID:unfiledSaved.id)
@@ -153,12 +174,68 @@ import LocalSupport
         let merged=try Summarizer.make(meeting:longMeeting,tasks:[],related:[],preferences:Preferences(),request:{prompt in
             let refs=calls<batches.count ? [batches[calls][0].id] : batches.map{$0[0].id}
             calls+=1
-            let response:[String:Any] = ["summary":"Combined discussion.","decision":"","question":"","evidence":refs,"changes":refs.map{["title":"Action from "+$0,"owner":"Me","evidence":[$0]] as [String:Any]}]
+            let response:[String:Any] = ["summary":"Combined discussion with supporting reasoning.","topics":"- Main discussion topic","decision":"","question":"","evidence":refs,"changes":refs.map{["title":"Action from "+$0,"owner":"Me","evidence":[$0]] as [String:Any]}]
             return String(decoding:try JSONSerialization.data(withJSONObject:response),as:UTF8.self)
         })
         try require(calls==batches.count+1 && merged.changes.count==batches.count,"Long summary merge lost section tasks")
+        try require(merged.topics == "- Main discussion topic" && merged.summary == "Combined discussion with supporting reasoning.","Long meeting merge replaced detail with topics")
         print("PASS long transcript batching and multi-section task merge with local mock responses")
-        do{_=try Summarizer.decode(json.replacingOccurrences(of:"seg2",with:"invented"),meeting:m,tasks:[t],related:[],config:AISettings());throw MeetingError("Accepted fabricated evidence")}catch let e as MeetingError{try require(e.message != "Accepted fabricated evidence","Invalid source accepted")}
+        let cache=root.appendingPathComponent("summary-resume")
+        func mockSection(_ prompt:String)throws->String {
+            let response:[String:Any] = ["summary":"Detailed discussion preserved.","topics":"- Timing","decision":"","question":"","evidence":[],"changes":[]]
+            return String(decoding:try JSONSerialization.data(withJSONObject:response),as:UTF8.self)
+        }
+        var interruptedCalls=0
+        do {
+            _=try Summarizer.make(meeting:longMeeting,tasks:[],related:[],preferences:Preferences(),request:{prompt in
+                interruptedCalls+=1
+                if interruptedCalls==2{throw MeetingError("Synthetic temporary failure")}
+                return try mockSection(prompt)
+            },cacheRoot:cache)
+            throw MeetingError("Expected a simulated failure")
+        }catch let error as MeetingError{try require(error.message=="Synthetic temporary failure","Unexpected checkpoint failure")}
+        var resumedCalls=0
+        let resumed=try Summarizer.make(meeting:longMeeting,tasks:[],related:[],preferences:Preferences(),request:{prompt in resumedCalls+=1;return try mockSection(prompt)},cacheRoot:cache)
+        try require(resumedCalls==batches.count && resumed.summary=="Detailed discussion preserved.","Retry did not reuse completed sections or lost detail")
+        var freshCalls=0
+        _=try Summarizer.make(meeting:longMeeting,tasks:[],related:[],preferences:Preferences(),request:{prompt in freshCalls+=1;return try mockSection(prompt)},cacheRoot:cache)
+        try require(freshCalls==batches.count+1,"A deliberate new draft incorrectly reused completed generation")
+        let parsedModels=AvailableAIModel.parse("Fetching available models…\nexample-model\tExample model\nexample-model\tDuplicate\ninvalid model\tInvalid\n")
+        try require(parsedModels==[AvailableAIModel(id:"example-model",title:"Example model")],"Model picker accepted malformed entries or duplicates")
+        print("PASS failed long summaries resume saved sections, new drafts start fresh, and model catalog parsing")
+        let badEvidence=try Summarizer.decode(json.replacingOccurrences(of:"seg2",with:"invented"),meeting:m,tasks:[t],related:[],config:AISettings())
+        try require(badEvidence.changes.isEmpty && badEvidence.deferredTasks?.count==1 && badEvidence.summary==legacyDraft.summary,"Invalid task evidence lost the summary or became an accepted task")
+        var mixed=try JSONSerialization.jsonObject(with:Data(json.utf8)) as! [String:Any]
+        let valid:[String:Any] = ["existingID":t.id,"title":"Updated comparison","evidence":["seg1"]]
+        mixed["changes"]=[valid,valid,["existingID":"missing-task","title":"Unmatched action","evidence":["seg2"]],["title":"New action","evidence":["seg2"]]]
+        let mixedJSON=String(decoding:try JSONSerialization.data(withJSONObject:mixed),as:UTF8.self)
+        let resilient=try Summarizer.decode(mixedJSON,meeting:m,tasks:[t],related:[],config:AISettings())
+        try require(resilient.summary==legacyDraft.summary && resilient.changes.count==2 && resilient.deferredTasks?.count==2,"Repeated or unknown task IDs rejected the whole summary")
+        var recovered=m;recovered.draft=resilient
+        let (_,safeTasks)=try Reconcile.apply(meeting:recovered,tasks:[t])
+        try require(safeTasks.count==2 && safeTasks.first{$0.id==t.id}?.revision==1,"Deferred tasks were applied or duplicate updates escaped validation")
+        let standalone=try Summarizer.decode(mixedJSON,meeting:unfiled,tasks:[t],related:[],config:AISettings())
+        try require(standalone.changes.count==1 && standalone.changes[0].existingID==nil && standalone.deferredTasks?.count==3,"Standalone meeting accessed another project's tasks")
+        let reviewReload=try JSONDecoder().decode(MeetingDraft.self,from:JSONEncoder().encode(resilient))
+        try require(reviewReload.deferredTasks==resilient.deferredTasks,"Deferred suggestions lost on reload")
+        try require(management.needsProjectChoice(unfiled),"New standalone meeting skipped project choice")
+        var confirmed=unfiled;confirmed.projectChoiceConfirmed=true
+        try require(!management.needsProjectChoice(confirmed),"Standalone choice was not remembered")
+        confirmed.projectID="missing"
+        try require(management.needsProjectChoice(confirmed),"Missing project passed preflight")
+        try require(management.saveProjectNotes(projectID,notes:"Compare tail latency; preserve assumptions."),"Project notes failed to save")
+        let notesReload=try Database(root:management.database.root).list(MeetingProject.self,kind:"project")
+        try require(notesReload.first{$0.id==projectID}?.notes=="Compare tail latency; preserve assumptions.","Project notes did not persist")
+        let legacyProject=try JSONDecoder().decode(MeetingProject.self,from:Data("{\"id\":\"old\",\"name\":\"Existing\",\"question\":\"\"}".utf8))
+        try require(legacyProject.notes==nil,"Older projects failed migration")
+        let responseRoot=root.appendingPathComponent("retained-response")
+        _=try Summarizer.make(meeting:unfiled,tasks:[],related:[],preferences:Preferences(),projectNotes:"Purpose fixture",request:{prompt in
+            try require(prompt.contains("Purpose fixture") && prompt.contains("ALL existingID values must be null"),"Project context or task identity rules omitted from prompt")
+            return mixedJSON
+        },cacheRoot:responseRoot)
+        let responseFiles=try FileManager.default.contentsOfDirectory(atPath:responseRoot.appendingPathComponent("Responses").path)
+        try require(responseFiles.count==1,"Original AI response was not retained")
+        print("PASS repeated/missing task recovery, standalone isolation, safe apply, project preflight/notes migration, and retained responses")
         let raw=Data("{\"transcription\":[{\"offsets\":{\"from\":1000,\"to\":2500},\"text\":\" A phrase.\"}]}".utf8)
         let segments=try Transcription.parse(raw,track:"system",offset:3,prefix:"test")
         try require(segments.first?.start==4 && segments.first?.end==5.5,"Track offset alignment failed")

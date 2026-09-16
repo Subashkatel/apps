@@ -143,6 +143,25 @@ enum Checks {
             catch { check("Antigravity rejects " + name + " without blaming sign-in", !error.localizedDescription.contains("Sign in")) }
         }
         let oldJSON = Data(#"{"provider":"claude","claudeModel":"","codexModel":"","serverModel":"","endpoint":"","executablePath":"","codexExecutablePath":""}"#.utf8)
+        let retryCLI=directory.appendingPathComponent("agy"),marker=directory.appendingPathComponent("retried")
+        try """
+        #!/bin/sh
+        cat >/dev/null
+        if [ ! -f '\(marker.path)' ]; then
+          touch '\(marker.path)'
+          printf '%s\\n' '{"event":"result","result":{"status":"ERROR","response":"","error":"UNAVAILABLE code 503: No capacity available"}}'
+          exit 1
+        fi
+        printf '%s\\n' '{"event":"result","result":{"status":"SUCCESS","response":"Recovered answer","error":null}}'
+        """.write(to:retryCLI,atomically:true,encoding:.utf8)
+        try FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:retryCLI.path)
+        gemini.geminiExecutablePath=retryCLI.path
+        check("temporary nonzero Antigravity capacity failure retries to completion",try AIClient.ask("Test",settings:gemini,timeout:15)=="Recovered answer")
+        for (message,expected,retryable) in [("RESOURCE_EXHAUSTED quota 429","usage or rate limit",false),("invalid model selection","does not recognize",false),("No capacity available 503","server capacity",true)] {
+            let data=try JSONSerialization.data(withJSONObject:["event":"result","result":["status":"ERROR","error":message,"response":"private partial source"]])
+            do{_=try AIClient.antigravityResponse(data);check("classified provider error",false)}
+            catch let error as LocalAIError{check("provider error classified: "+expected,error.localizedDescription.contains(expected) && error.retryable==retryable && !error.localizedDescription.contains("private partial source"))}
+        }
         let oldSettings = try JSONDecoder().decode(AISettings.self, from: oldJSON)
         check("existing provider settings decode without Gemini migration", oldSettings.provider == .claude && oldSettings.geminiModel == nil)
         exit(failures == 0 ? 0 : 1)

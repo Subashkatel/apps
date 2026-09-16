@@ -58,6 +58,9 @@ struct MeetingDraft: Codable, Equatable {
     var suggestedTitle: String?
     var contextMeetingIDs: [String]?
     var omittedContextCount: Int?
+    var topics: String?
+    var reviewIssues: [String]?
+    var deferredTasks: [DeferredTask]?
 }
 struct Meeting: Codable, Identifiable, Equatable {
     var id = UUID().uuidString
@@ -74,6 +77,7 @@ struct Meeting: Codable, Identifiable, Equatable {
     var error: String?
     var draft: MeetingDraft?
     var deletedAt: Date?
+    var projectChoiceConfirmed: Bool?
     var titleEdited: Bool?
     var attachments: [MeetingAttachment]?
     mutating func receiveDraft(_ value:MeetingDraft,requestedTitle:String) {
@@ -88,6 +92,7 @@ struct MeetingProject: Codable, Identifiable, Equatable {
     var id = UUID().uuidString
     var name: String
     var question = ""
+    var notes: String?
 }
 struct WorkTask: Codable, Identifiable, Equatable {
     var id = UUID().uuidString

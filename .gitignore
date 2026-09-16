@@ -58,3 +58,7 @@ Backups/
 ClaudeProfiles/
 CodexProfiles/
 Pomodoro/reference/
+
+# Private calendar exports and AI summary checkpoints.
+*.ics
+Summary progress/

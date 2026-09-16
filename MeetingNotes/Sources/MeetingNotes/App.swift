@@ -7,6 +7,13 @@ import LocalSupport
 
 @main @MainActor enum MeetingNotesMain {
     static func main() {
+        if CommandLine.arguments.contains("--discussion-check") {
+            Task {do{try await DiscussionTests.run();exit(0)}catch{print("FAIL discussion: \(error)");exit(1)}}
+            NSApplication.shared.run();return
+        }
+        if let i=CommandLine.arguments.firstIndex(of:"--discussion-ai-check"),CommandLine.arguments.count>i+1,let provider=AIProvider(rawValue:CommandLine.arguments[i+1]) {
+            do{try DiscussionTests.live(provider:provider);exit(0)}catch{print("FAIL live discussion: \(error)");exit(1)}
+        }
         if CommandLine.arguments.contains("--wake-check") {do{let wake=RecordingWakeLock();try wake.start();Thread.sleep(forTimeInterval:3);wake.stop();print("PASS recording idle-sleep assertion created and released");exit(0)}catch{print("FAIL: \(error)");exit(1)}}
         if let i=CommandLine.arguments.firstIndex(of:"--long-audio-check"),CommandLine.arguments.count>i+1 {do{try SelfTests.longAudio(URL(fileURLWithPath:CommandLine.arguments[i+1]));exit(0)}catch{print("FAIL: \(error)");exit(1)}}
         if CommandLine.arguments.contains("--self-test") {do{try SelfTests.run();exit(0)}catch{print("FAIL: \(error)");exit(1)}}
@@ -37,24 +44,38 @@ import LocalSupport
     private var shortcutSetting:Bool?
     private var lastIcon=""
     private var modePopup:NSPopover?
+    private let previewMode=AppLaunchMode.isPreview(bundleID:Bundle.main.bundleIdentifier,arguments:CommandLine.arguments)
     func applicationDidFinishLaunching(_ notification:Notification) {
         let others=NSRunningApplication.runningApplications(withBundleIdentifier:Bundle.main.bundleIdentifier ?? "local.meetingnotes").filter{$0.processIdentifier != ProcessInfo.processInfo.processIdentifier}
         if let existing=others.first{existing.activate();NSApp.terminate(nil);return}
         do{
-            if CommandLine.arguments.contains("--ui-check") || CommandLine.arguments.contains("--ui-inspect") {
+            if previewMode {
                 let root=FileManager.default.temporaryDirectory.appendingPathComponent("meetingnotes-ui-"+UUID().uuidString)
                 try UIQA.fixture(root:root);store=try MeetingStore(root:root,recover:false)
             }else{store=try MeetingStore()}
         }catch{let alert=NSAlert();alert.messageText="Meeting Notes could not open its data";alert.informativeText=error.localizedDescription+"\nThe existing files have not been replaced.";alert.addButton(withTitle:"Open data folder");alert.addButton(withTitle:"Quit");if alert.runModal() == .alertFirstButtonReturn{NSWorkspace.shared.open(Preferences.root)};NSApp.terminate(nil);return}
+        if CommandLine.arguments.contains("--discussion-ui-inspect") {
+            store.update("qa-meeting"){$0.draft=MeetingDraft(summary:"We discussed how to compare two datasets without hiding slow cases in the average.",decision:"Compare two datasets before changing the experiment.",question:"Would bursty arrivals change the result?",changes:[],evidence:["qa-1"],provider:"Claude",model:"sonnet",applied:true,originalNotes:$0.notes,topics:"- Slow cases and comparison assumptions\n- Bursty arrivals")}
+            store.discussion.responder={prompt,settings,effort,token in
+                for _ in 0..<(prompt.contains("Please test stopping") ? 600:60){try token.check();Thread.sleep(forTimeInterval:0.05)}
+                let raw=prompt.components(separatedBy:"SOURCES: ").last?.components(separatedBy:"\nPRIOR CONVERSATION:").first ?? "[]"
+                let sources=(try? JSONDecoder().decode([DiscussionSource].self,from:Data(raw.utf8))) ?? []
+                let id=sources.filter{$0.segmentID != nil}.prefix(2).map(\.id).joined(separator:", ")
+                return "The comparison should account for slow cases [\(id)].\n\n- Check the assumptions.\n- Consider bursty arrivals.\n\nThis is a synthetic UI test reply."
+            }
+        }
         if let url=Bundle.main.url(forResource:"AppIcon",withExtension:"icns"),let icon=NSImage(contentsOf:url){NSApp.applicationIconImage=icon}
         window=NSWindow(contentRect:NSRect(x:0,y:0,width:1060,height:760),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
-        window.title="Meeting Notes";window.titleVisibility = .hidden;window.titlebarAppearsTransparent=true;window.isReleasedWhenClosed=false;window.delegate=self
+        window.title=previewMode ? "Meeting Notes — Test data":"Meeting Notes";window.titleVisibility = previewMode ? .visible:.hidden;window.titlebarAppearsTransparent=true;window.isReleasedWhenClosed=false;window.delegate=self
         window.contentView=NSHostingView(rootView:MeetingRoot(store:store));window.center()
         store.showWindow = { [weak self] in self?.openWindow() }
-        statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
-        statusItem.button?.target=self;statusItem.button?.action=#selector(statusClick);statusItem.button?.sendAction(on:[.leftMouseUp,.rightMouseUp])
+        if !previewMode {
+            statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
+            statusItem.button?.target=self;statusItem.button?.action=#selector(statusClick);statusItem.button?.sendAction(on:[.leftMouseUp,.rightMouseUp])
+        }
         buildMainMenu()
         store.objectWillChange.sink{[weak self] _ in DispatchQueue.main.async{self?.refresh()}}.store(in:&subscriptions)
+        store.discussion.objectWillChange.sink{[weak self] _ in DispatchQueue.main.async{self?.refreshLayout()}}.store(in:&subscriptions)
         store.meter.objectWillChange.sink{[weak self] _ in DispatchQueue.main.async{self?.refreshIcon()}}.store(in:&subscriptions)
         NSWorkspace.shared.notificationCenter.addObserver(self,selector:#selector(willSleep),name:NSWorkspace.willSleepNotification,object:nil)
         refresh();openWindow()
@@ -73,21 +94,33 @@ import LocalSupport
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication)->Bool{false}
     func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
         guard store != nil else{return .terminateNow}
-        if store.isRecording || store.busy || store.unsavedCount>0 {
-            let alert=NSAlert();alert.messageText="Quit Meeting Notes?";alert.informativeText="Recording will stop and the saved audio will be retained. Unfinished transcription resumes when you reopen the app.";alert.addButton(withTitle:"Keep running");alert.addButton(withTitle:"Stop and quit")
+        if store.isRecording || store.busy || store.unsavedCount>0 || !store.discussion.running.isEmpty {
+            let alert=NSAlert();alert.messageText="Quit Meeting Notes?";alert.informativeText="Recording will stop and the saved audio will be retained. Unfinished transcription resumes when you reopen the app. Discussion replies stop; saved conversations can be continued.";alert.addButton(withTitle:"Keep running");alert.addButton(withTitle:"Stop and quit")
             guard alert.runModal() == .alertSecondButtonReturn else{return .terminateCancel}
         }
-        store.stopRecording();guard store.flush() else{return .terminateCancel};TranscriptionProcess.shared.cancelAll();return .terminateNow
+        store.discussion.stopAll();store.stopRecording();guard store.flush() else{return .terminateCancel};TranscriptionProcess.shared.cancelAll();return .terminateNow
     }
     @objc private func willSleep(){if store.isRecording{store.stopRecording(reason:"Recording stopped because the Mac went to sleep. Audio already captured is saved.")}}
     private func refresh(){
         refreshIcon()
+        refreshLayout()
         guard store != nil else{return}
         window.appearance=NSAppearance(named:store.preferences.appearance == "light" ? .aqua:.darkAqua)
         let hex:UInt32=store.preferences.appearance == "light" ? 0xf7f5ed:0x22251f
         window.backgroundColor=NSColor(srgbRed:CGFloat((hex>>16)&255)/255,green:CGFloat((hex>>8)&255)/255,blue:CGFloat(hex&255)/255,alpha:1)
         window.titlebarSeparatorStyle = .none
         if shortcutSetting != store.preferences.globalShortcuts {registerShortcuts()}
+    }
+    private func refreshLayout(){
+        guard let store,let window else{return}
+        let minimum:CGFloat=store.discussion.isOpen && store.sidebar ? 1020:780
+        window.contentMinSize=NSSize(width:minimum,height:560)
+        let width=window.contentView?.bounds.width ?? window.frame.width
+        if width<minimum {
+            var frame=window.frame;frame.size.width += minimum-width
+            if let visible=window.screen?.visibleFrame{frame.origin.x=max(visible.minX,min(frame.origin.x,visible.maxX-frame.width))}
+            window.setFrame(frame,display:true)
+        }
     }
     private func refreshIcon(){
         guard store != nil,statusItem != nil else{return}
@@ -102,7 +135,7 @@ import LocalSupport
     }
     private func registerShortcuts(){
         shortcutSetting=store.preferences.globalShortcuts;hotKeys=[]
-        guard store.preferences.globalShortcuts else{return}
+        guard !previewMode,store.preferences.globalShortcuts else{return}
         do {
             hotKeys.append(try MeetingHotKey(key:kVK_ANSI_R,modifiers:controlKey|optionKey){[weak self] in self?.toggle()})
             // Jot already owns Control-Option-S on this Mac.
@@ -133,7 +166,7 @@ import LocalSupport
     @objc private func micMode(){setMode(.microphone)}
     @objc private func callMode(){setMode(.call)}
     private func setMode(_ mode:CaptureMode){if store.preferences.mode != mode{switchMode()}}
-    private func switchMode(){store.toggleMode();refresh();let popover=NSPopover();popover.behavior = .transient;popover.contentSize=NSSize(width:250,height:65);popover.contentViewController=NSHostingController(rootView:Text((store.isRecording ? "Next recording: ":"")+(store.preferences.mode == .microphone ? "Bear · In person":"Chicken · Online meeting")).font(.system(size:13,weight:.medium)).padding(16));modePopup?.close();modePopup=popover;if let button=statusItem.button{popover.show(relativeTo:button.bounds,of:button,preferredEdge:.minY)};DispatchQueue.main.asyncAfter(deadline:.now()+1.5){[weak popover] in popover?.close()}}
+    private func switchMode(){store.toggleMode();refresh();let popover=NSPopover();popover.behavior = .transient;popover.contentSize=NSSize(width:250,height:65);popover.contentViewController=NSHostingController(rootView:Text((store.isRecording ? "Next recording: ":"")+(store.preferences.mode == .microphone ? "Bear · In person":"Chicken · Online meeting")).font(.system(size:13,weight:.medium)).padding(16));modePopup?.close();modePopup=popover;if let button=statusItem?.button{popover.show(relativeTo:button.bounds,of:button,preferredEdge:.minY)};DispatchQueue.main.asyncAfter(deadline:.now()+1.5){[weak popover] in popover?.close()}}
     private func buildMainMenu(){
         let root=NSMenu(),app=NSMenu();let appItem=NSMenuItem();appItem.submenu=app;root.addItem(appItem)
         item(app,"Open Meeting Notes",#selector(openAction));item(app,"Settings…",#selector(settingsAction),",");app.addItem(.separator());item(app,"Quit Meeting Notes",#selector(quitAction),"q")

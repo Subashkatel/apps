@@ -9,6 +9,7 @@ import LocalSupport
 
 @MainActor final class MeetingStore: ObservableObject {
     let database: Database
+    let discussion: DiscussionStore
     @Published var meetings: [Meeting]
     @Published var projects: [MeetingProject]
     @Published var tasks: [WorkTask]
@@ -16,15 +17,19 @@ import LocalSupport
     @Published var selection: String?
     @Published var settingsOpen = false
     @Published var pendingDeleteMeeting: String?
+    @Published var pendingSummaryID: String?
+    var pendingTaskRecovery=false
     @Published var error: String?
     @Published var status = ""
     @Published var starting = false
     @Published var activeID: String?
     @Published var drafting = Set<String>()
+    @Published var summaryProgress: [String:String] = [:]
     @Published var transcriptionProgress: [String:String] = [:]
     @Published var sidebar = true
     @Published var sourceSegment: String?
     @Published var transcriptOpen = false
+    @Published var transcriptUsesCurrentVersion = false
     @Published var playingID: String?
     let meter = RecordingMeter()
     var showWindow: (() -> Void)?
@@ -33,9 +38,9 @@ import LocalSupport
     private var queueBusy = false
     private var unsaved = Set<String>()
     let playback = MeetingPlayback()
-    private var tick = 0
     init(root: URL = Preferences.root, recover: Bool = true) throws {
         database = try Database(root:root)
+        discussion = try DiscussionStore(database:database)
         meetings = try database.list(Meeting.self,kind:"meeting").sorted{$0.created>$1.created}
         projects = try database.list(MeetingProject.self,kind:"project").sorted{$0.name<$1.name}
         tasks = try database.list(WorkTask.self,kind:"task")
@@ -50,7 +55,6 @@ import LocalSupport
                 if let i = meetings.firstIndex(where:{$0.id==m.id}) { meetings[i] = m }
             }
         }
-        meterTimer = Timer.scheduledTimer(withTimeInterval:0.05,repeats:true) { [weak self] _ in Task { @MainActor in self?.tickCapture() } }
         if recover { Task { await processQueue() } }
     }
     var current: Meeting? { meetings.first{$0.id == selection && $0.deletedAt==nil} }
@@ -61,7 +65,7 @@ import LocalSupport
     func report(_ error: Error) { self.error = error.localizedDescription }
     func select(_ id: String?) {
         if meetings.contains(where:{$0.id==id && $0.deletedAt != nil}){status="This meeting is in Recently deleted. Restore it to open it.";return}
-        selection=id; transcriptOpen=false; sourceSegment=nil; stopPlayback() }
+        selection=id; transcriptOpen=false; sourceSegment=nil; transcriptUsesCurrentVersion=false; stopPlayback() }
     func update(_ id: String, _ transform: (inout Meeting)->Void) {
         guard let i=meetings.firstIndex(where:{$0.id==id}) else{return}
         var m=meetings[i];transform(&m);meetings[i]=m
@@ -70,10 +74,10 @@ import LocalSupport
     }
     @discardableResult func flush() -> Bool {
         for id in unsaved { if let m=meetings.first(where:{$0.id==id}) { do{try database.put(m,kind:"meeting",id:id);unsaved.remove(id)}catch{report(error);return false} } }
-        return true
+        return discussion.flush()
     }
     func savePreferences(_ value: Preferences, validateAI: Bool = false) {
-        do { if validateAI {_ = try value.ai.validated()}; try database.put(value,kind:"preferences",id:"settings");preferences=value;settingsOpen=false }
+        do { if validateAI {_ = try value.ai.validated()}; try database.put(value,kind:"preferences",id:"settings");preferences=value;if isRecording{startCaptureMonitoring()};settingsOpen=false }
         catch { report(error) }
     }
     func toggleMode() {
@@ -85,6 +89,15 @@ import LocalSupport
         guard !projects.contains(where:{$0.name.caseInsensitiveCompare(name) == .orderedSame}) else { error="A project with that name already exists.";return }
         let p=MeetingProject(name:name)
         do{try database.put(p,kind:"project",id:p.id);projects.append(p);selection="project:"+p.id}catch{report(error)}
+    }
+    @discardableResult func saveProjectNotes(_ id:String,notes:String)->Bool {
+        guard let i=projects.firstIndex(where:{$0.id==id}) else{return false}
+        var project=projects[i];project.notes=notes
+        do{try database.put(project,kind:"project",id:id);projects[i]=project;return true}catch{report(error);return false}
+    }
+    func needsProjectChoice(_ meeting:Meeting)->Bool {
+        if let id=meeting.projectID{return !projects.contains{$0.id==id}}
+        return meeting.projectChoiceConfirmed != true
     }
     func addTask(_ title:String,project:String) {
         _ = saveTask(WorkTask(projectID:project,title:title,owner:"Me"))
@@ -105,7 +118,8 @@ import LocalSupport
     func assignProject(_ id:String,project:String?) {
         guard !drafting.contains(id),let i=meetings.firstIndex(where:{$0.id==id}) else{return}
         guard project == nil || projects.contains(where:{$0.id==project}) else{return}
-        var m=meetings[i];guard m.projectID != project else{return}
+        var m=meetings[i];guard m.projectID != project || m.projectChoiceConfirmed != true else{return}
+        m.projectChoiceConfirmed=true
         // Saved tasks retain their independent project. Only unfiled tasks from
         // this meeting are filed automatically; existing project work is never moved.
         var changed=tasks.filter{$0.deletedAt==nil && $0.meetingID==id && $0.projectID==nil && project != nil}
@@ -140,11 +154,12 @@ import LocalSupport
             capture=session
             do { try session.start(folder:database.folder(m.id),echoCancellation:preferences.echoCancellation) }
             catch { _=session.stop();capture=nil;update(m.id){$0.phase = .failed;$0.ended=Date();$0.error=String(describing:error);$0.captureIssue=$0.error};throw error }
-            activeID=m.id;status="Recording";stopPlayback()
+            activeID=m.id;startCaptureMonitoring();status="Recording";stopPlayback()
         }catch{report(error);showWindow?()}
     }
     func stopRecording(reason: String? = nil) {
         guard let session=capture else{return}
+        meterTimer?.invalidate();meterTimer=nil
         let offsets=session.stop();capture=nil;activeID=nil;meter.mouth=0
         update(session.id){m in m.ended=Date();m.offsets=offsets;m.error=reason;m.captureIssue=reason;m.phase = reason != nil ? .interrupted : preferences.autoTranscribe ? .transcribing : .recorded}
         if let m=meetings.first(where:{$0.id==session.id}) {do{try database.archive(m)}catch{report(error)}}
@@ -152,14 +167,20 @@ import LocalSupport
         if let reason { error=reason;showWindow?() }
         if reason == nil && flush() {Task{await processQueue()}}
     }
+    var isMonitoringCapture:Bool{meterTimer?.isValid == true}
+    private func startCaptureMonitoring() {
+        meterTimer?.invalidate()
+        let interval:TimeInterval=preferences.animateBear && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0.05:1
+        meterTimer=Timer.scheduledTimer(withTimeInterval:interval,repeats:true){[weak self] _ in Task{@MainActor in self?.tickCapture()}}
+        meterTimer?.tolerance=interval*0.2
+    }
     private func tickCapture() {
         let mouth = meter.mouth
         let target = preferences.animateBear && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? capture?.mouthLevel ?? 0 : 0
         let value=mouth+(target-mouth)*(target>mouth ? 0.55:0.3)
         let next=value<0.015 ? 0 : value
         if abs(next-mouth)>0.02 || (next==0 && mouth != 0) {meter.mouth=next}
-        tick+=1
-        if tick%20==0,let problem=capture?.error {stopRecording(reason:problem)}
+        if let problem=capture?.error {stopRecording(reason:problem)}
     }
     func transcribe(_ id: String) {
         guard id != activeID,!drafting.contains(id),transcriptionProgress[id]==nil,flush() else{return}
@@ -185,11 +206,15 @@ import LocalSupport
     }
     func summarize(_ id: String) async {
         guard !drafting.contains(id),id != activeID,let m=meetings.first(where:{$0.id==id}),flush() else{return}
+        guard !m.transcript.isEmpty else{error="Transcribe the recording before summarizing.";return}
+        guard !needsProjectChoice(m) else{pendingTaskRecovery=false;pendingSummaryID=id;return}
+        let background=projects.first{$0.id==m.projectID}?.notes ?? ""
         let prefs=preferences,taskSnapshot=tasks,prior=meetings.filter{$0.id != id && $0.deletedAt == nil}.sorted{$0.created>$1.created}
-        drafting.insert(id);defer{drafting.remove(id)}
+        drafting.insert(id);error=nil;update(id){$0.error=nil};defer{drafting.remove(id);summaryProgress[id]=nil}
         do {
             _=try prefs.ai.validated()
-            let draft=try await Task.detached {try Summarizer.make(meeting:m,tasks:taskSnapshot,related:prior,preferences:prefs)}.value
+            let cache=database.folder(id).appendingPathComponent("Summary progress",isDirectory:true)
+            let draft=try await Task.detached {try Summarizer.make(meeting:m,tasks:taskSnapshot,related:prior,preferences:prefs,projectNotes:background,cacheRoot:cache){message in Task{@MainActor [weak self] in self?.summaryProgress[id]=message}}}.value
             // Keep text typed while the request was running. The draft stores its original snapshot.
             update(id){$0.receiveDraft(draft,requestedTitle:m.title)}
         }catch{update(id){$0.error=error.localizedDescription};report(error)}
@@ -197,15 +222,19 @@ import LocalSupport
     func findTasks(_ id:String) async {
         guard !drafting.contains(id),id != activeID,let m=meetings.first(where:{$0.id==id}),
               let old=m.draft,old.changes.isEmpty,old.appliedTaskIDs.isEmpty,flush() else{return}
+        guard !needsProjectChoice(m) else{pendingTaskRecovery=true;pendingSummaryID=id;return}
+        let background=projects.first{$0.id==m.projectID}?.notes ?? ""
         let prefs=preferences,existing=tasks
         drafting.insert(id);defer{drafting.remove(id)}
         do {
             try database.backup(force:true)
             var source=m;source.transcript=old.sourceTranscript ?? m.transcript
-            let result=try await Task.detached{try Summarizer.make(meeting:source,tasks:existing,related:[],preferences:prefs)}.value
+            let result=try await Task.detached{try Summarizer.make(meeting:source,tasks:existing,related:[],preferences:prefs,projectNotes:background)}.value
             update(id){meeting in
                 // Preserve the edited summary, notes, decisions and original AI attribution.
                 meeting.draft?.changes=result.changes
+                meeting.draft?.deferredTasks=result.deferredTasks
+                meeting.draft?.reviewIssues=result.reviewIssues
                 meeting.draft?.sourceTranscript=source.transcript
                 if !result.changes.isEmpty{meeting.draft?.applied=false}
                 meeting.error=nil
@@ -287,9 +316,14 @@ import LocalSupport
     static func markdown(_ m: Meeting)->String {
         var text="# \(m.title)\n\n\(m.created.formatted(date:.long,time:.shortened))\n"
         if let d=m.draft {
-            text+="\n\(d.summary)\n"
+            if let topics=d.topics,!topics.isEmpty{text+="\n## What we talked about\n\(topics)\n"}
+            text+="\n## Detailed summary\n\(d.summary)\n"
             if !d.decision.isEmpty{text+="\n## Decided\n\(d.decision)\n"}
             if !d.question.isEmpty{text+="\n## Still open\n\(d.question)\n"}
+            if let deferred=d.deferredTasks,!deferred.isEmpty{
+                text+="\n## Task suggestions needing review\n"
+                for item in deferred{text+="\n- \(item.title): \(item.reason)\n\nOriginal suggestion: \(item.response)\n"}
+            }
             text+="\nDrafted with \(d.provider) · \(d.model)\n"
         }
         text+="\n## My notes\n\(m.notes)\n\n## Transcript\n"
